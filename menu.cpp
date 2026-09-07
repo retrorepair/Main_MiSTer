@@ -2593,6 +2593,7 @@ void HandleUI(void)
 											mcd_reset();
 											opt = "[0]";
 										}
+										if (bit == 38) mcd_eject();  // OSD "Eject Disc": eject only, no reset
 									}
 
 									if (is_pce() && !bit) pcecd_reset();

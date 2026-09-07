@@ -185,6 +185,15 @@ void mcd_reset() {
 	need_reset = 1;
 }
 
+// "Eject Disc" (OSD R[38]): open the tray WITHOUT resetting either 68000 or reloading the BIOS.
+// The running BIOS sees the drive report CD_STAT_OPEN on the next 75 Hz poll and behaves as if the
+// disc were physically removed (as on hardware). Re-inserting via the OSD file browser calls
+// mcd_set_image() again. This is the eject half of "Reset & Eject CD" (R[0]) split out on its own.
+void mcd_eject() {
+	cdd.Unload();
+	cdd.status = CD_STAT_OPEN;
+}
+
 int mcd_send_data(uint8_t* buf, int len, uint8_t index) {
 	// set index byte
 	user_io_set_index(index);

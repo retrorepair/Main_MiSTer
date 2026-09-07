@@ -99,6 +99,7 @@ extern cdd_t cdd;
 void mcd_poll();
 void mcd_set_image(int num, const char *filename);
 void mcd_reset();
+void mcd_eject();
 int mcd_send_data(uint8_t* buf, int len, uint8_t index);
 int mcd_can_send_data(uint8_t type);
 void mcd_fill_blanksave(uint8_t *buffer, uint32_t lba);
