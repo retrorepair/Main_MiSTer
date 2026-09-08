@@ -125,7 +125,19 @@ void mcd_set_image(int num, const char *filename)
 	cdd.Unload();
 	cdd.status = CD_STAT_OPEN;
 
-	int same_game = *filename && *last_dir && !strncmp(last_dir, filename, strlen(last_dir));
+	// "Same game" decides whether the disc is hot-swapped (drive only, core keeps running) or the
+	// machine is restarted with that game's BIOS, save and cheats.  The test is a directory-prefix
+	// match, which is right for a multi-disc game in its own folder but wrong for the far more
+	// common flat folder of unrelated games: there every title matches every other, so inserting a
+	// different game hot-swapped the disc into the previous game's BIOS and save file and, to the
+	// user, "nothing happened".
+	//
+	// The MegaCD core offers "Disc Insert: Reset | Keep Running" for exactly this choice, so ask
+	// it.  Default (bit 36 clear) restarts on every disc change, which is what a flat library
+	// wants; set it for a multi-disc game and the directory match applies as before.  Cores that
+	// do not define bit 36 read 0 and get the restart behaviour.
+	int keep_running = is_megacd() ? (int)user_io_status_get("[36]") : 0;
+	int same_game = keep_running && *filename && *last_dir && !strncmp(last_dir, filename, strlen(last_dir));
 	strcpy(last_dir, filename);
 	char *p = strrchr(last_dir, '/');
 	if (p) *p = 0;
