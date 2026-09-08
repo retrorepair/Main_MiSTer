@@ -139,53 +139,47 @@ void mcd_set_image(int num, const char *filename)
 	int keep_running = is_megacd() ? (int)user_io_status_get("[36]") : 0;
 	int same_game = keep_running && *filename && *last_dir && !strncmp(last_dir, filename, strlen(last_dir));
 	printf("MCD: disc change - keep_running=%d same_game=%d (%s)\n", keep_running, same_game,
-	       same_game ? "swap the disc, core keeps running" : "restart with this game's BIOS and save");
+	       same_game ? "swap the disc, core keeps running" : "new game: swap save/cheats; disc inserted, console keeps running");
 	strcpy(last_dir, filename);
 	char *p = strrchr(last_dir, '/');
 	if (p) *p = 0;
 
-	int loaded = 1;
-	if (!same_game)
-	{
-		mcd_mount_save("");
+	// A disc insert is a tray-close on a RUNNING console and must NOT reset the machine.  On a real
+	// Mega CD you open the tray, swap the disc and close it; the drive reports tray-open then
+	// disc-present and the software reacts - the BIOS boots the new disc, a running game halts
+	// until you press Reset.  The console's BIOS ROM is not part of the disc (Main loads
+	// <home>/boot.rom at core start), so it is NOT reloaded here: in the core a BIOS download is a
+	// full cold reset (bios_download -> loading -> md_reset), which was exactly the unwanted
+	// "insert a disc at the BIOS => the machine resets".  The only downloads left on this path are a
+	// game's OWN cd_bios.rom / cart.rom - a genuine BIOS/cartridge swap that cannot happen under a
+	// running CPU, so those still reset, but only when such a file exists (user_io_file_tx opens the
+	// file before it touches the download strobe).  Swapping the per-game save (mcd_mount_save is an
+	// SD-image mount on index 5, not a ROM index) and the cheats is HPS-side bookkeeping and does
+	// not reset the core.  "Reset & Eject CD" (R[0]) still resets: menu.cpp pulses status[0] itself.
+	if (!same_game) mcd_mount_save("");   // flush/close the previous game's save before swapping
 
-		user_io_status_set("[0]", 1);
-		user_io_status_set("[0]", 0);
-		mcd_reset();
-
-		loaded = 0;
-		strcpy(buf, last_dir);
-		char *p = strrchr(buf, '/');
-		if (p)
-		{
-			strcpy(p + 1, "cd_bios.rom");
-			loaded = user_io_file_tx(buf);
-		}
-
-		if (!loaded)
-		{
-			sprintf(buf, "%s/boot.rom", HomeDir());
-			loaded = user_io_file_tx(buf);
-		}
-
-		if (!loaded) Info("CD BIOS not found!", 4000);
-	}
-
-	if (loaded && *filename)
+	if (*filename)
 	{
 		if (cdd.Load(filename) > 0)
 		{
-			cdd.status = cdd.loaded ? CD_STAT_STOP : CD_STAT_NO_DISC;
+			cdd.status = cdd.loaded ? CD_STAT_STOP : CD_STAT_NO_DISC;   // tray closed, disc present
 			cdd.latency = 10;
 			cdd.SendData = mcd_send_data;
 			cdd.CanSendData = mcd_can_send_data;
 
 			if (!same_game)
 			{
-				mcd_load_rom(filename, "cd_bios.rom", 0);
-				mcd_load_rom(filename, "cart.rom", 1);
+				int own_bios = mcd_load_rom(filename, "cd_bios.rom", 0);  // only if the game ships one (resets)
+				mcd_load_rom(filename, "cart.rom", 1);                    // only if the game ships one (resets)
 				mcd_mount_save(filename);
 				cheats_init(filename, 0);
+
+				// Nothing to run?  Warn if <home>/boot.rom is missing and the game brought no BIOS.
+				if (!own_bios)
+				{
+					sprintf(buf, "%s/boot.rom", HomeDir());
+					if (!FileExists(buf)) Info("CD BIOS not found!", 4000);
+				}
 			}
 		}
 		else

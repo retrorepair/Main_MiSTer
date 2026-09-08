@@ -343,6 +343,11 @@ void cdd_t::Unload()
 }
 
 void cdd_t::Reset() {
+	// A hardware-reset drive is idle: STOP.  (NOT Genesis Plus GX's CD_TOC: the core pulses this reset
+	// on every ERES_N edge - i.e. every 68000 RESET instruction the BIOS executes during its init, as
+	// real hardware does - and the BIOS's init only proceeds if the drive answers STOP after each one;
+	// TOC here made it reset the sub-system for ever.  GPGX gets away with TOC only because it never
+	// resets the drive on a RESET instruction.)  Verified on hardware 2026-09-08.
 	latency = 10;
 	index = 0;
 	lba = 0;
@@ -886,7 +891,18 @@ void cdd_t::SeekToLBA(int lba, int play) {
 		// Time Gal) need at least 12 interrupts; Space Adventure Cobra (2nd morgue scene) needs 13
 		// including seek time. The previous model gave Play 11 and Seek 0 plus the distance term,
 		// so a short seek or play answered up to two interrupts early.
-		if (!this->latency) this->latency = 12;
+		//
+		// That carry-over is for a seek/play still IN FLIGHT.  It must not apply to the drive's
+		// post-reset init delay (cdd_t::Reset() sets latency = 10): the Mega CD BIOS's very first SEEK
+		// after a reset arrives while that countdown is still running and inherited its remainder
+		// (~6), so the seek answered early with an inconsistent report and the BIOS aborted it with
+		// STOP.  A cold boot survives because the BIOS retries TOC+SEEK once the drive is idle (the
+		// second SEEK gets a fresh 12 and completes to PAUSE); a WARM reset does not retry - its
+		// preserved work RAM already says the disc is known - and dropped to "Put a DISC on the CD
+		// tray" although the disc was still mounted.  Traced on hardware 2026-09-08.  A real drive's
+		// seek always takes its seek time: only carry a latency over when the drive really is moving.
+		int in_flight = (this->status == CD_STAT_PLAY || this->status == CD_STAT_SEEK || this->status == CD_STAT_SCAN);
+		if (!this->latency || !in_flight) this->latency = 12;
 	}
 	else
 	{
