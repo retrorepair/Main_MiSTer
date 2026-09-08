@@ -190,6 +190,7 @@ void mcd_reset() {
 // disc were physically removed (as on hardware). Re-inserting via the OSD file browser calls
 // mcd_set_image() again. This is the eject half of "Reset & Eject CD" (R[0]) split out on its own.
 void mcd_eject() {
+	printf("MCD: eject - tray open, core left running\n");
 	cdd.Unload();
 	cdd.status = CD_STAT_OPEN;
 }
