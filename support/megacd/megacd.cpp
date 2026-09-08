@@ -138,6 +138,8 @@ void mcd_set_image(int num, const char *filename)
 	// do not define bit 36 read 0 and get the restart behaviour.
 	int keep_running = is_megacd() ? (int)user_io_status_get("[36]") : 0;
 	int same_game = keep_running && *filename && *last_dir && !strncmp(last_dir, filename, strlen(last_dir));
+	printf("MCD: disc change - keep_running=%d same_game=%d (%s)\n", keep_running, same_game,
+	       same_game ? "swap the disc, core keeps running" : "restart with this game's BIOS and save");
 	strcpy(last_dir, filename);
 	char *p = strrchr(last_dir, '/');
 	if (p) *p = 0;
