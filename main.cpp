@@ -39,6 +39,12 @@ const char *version = "$VER:" VDATE;
 
 int main(int argc, char *argv[])
 {
+	// stdout is line-buffered on a terminal but block-buffered when redirected, so a log kept
+	// with "MiSTer > file" holds the last few kilobytes hostage - a handful of lines written in
+	// response to something you just did stay invisible until unrelated output pushes them out.
+	// That is exactly when the log matters most. Ask for line buffering either way.
+	setvbuf(stdout, NULL, _IOLBF, 0);
+
 	// Always pin main worker process to core #1 as core #0 is the
 	// hardware interrupt handler in Linux.  This reduces idle latency
 	// in the main loop by about 6-7x.
