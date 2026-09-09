@@ -892,17 +892,11 @@ void cdd_t::SeekToLBA(int lba, int play) {
 		// including seek time. The previous model gave Play 11 and Seek 0 plus the distance term,
 		// so a short seek or play answered up to two interrupts early.
 		//
-		// That carry-over is for a seek/play still IN FLIGHT.  It must not apply to the drive's
-		// post-reset init delay (cdd_t::Reset() sets latency = 10): the Mega CD BIOS's very first SEEK
-		// after a reset arrives while that countdown is still running and inherited its remainder
-		// (~6), so the seek answered early with an inconsistent report and the BIOS aborted it with
-		// STOP.  A cold boot survives because the BIOS retries TOC+SEEK once the drive is idle (the
-		// second SEEK gets a fresh 12 and completes to PAUSE); a WARM reset does not retry - its
-		// preserved work RAM already says the disc is known - and dropped to "Put a DISC on the CD
-		// tray" although the disc was still mounted.  Traced on hardware 2026-09-08.  A real drive's
-		// seek always takes its seek time: only carry a latency over when the drive really is moving.
-		int in_flight = (this->status == CD_STAT_PLAY || this->status == CD_STAT_SEEK || this->status == CD_STAT_SCAN);
-		if (!this->latency || !in_flight) this->latency = 12;
+		// Keep this EXACTLY as Genesis Plus GX has it.  A stricter rule (force 12 whenever the drive
+		// is not already in PLAY/SEEK/SCAN, tried 2026-09-08 for the warm-reset boot read) froze
+		// The Amazing Spider-Man on its level select - the first time that game ever froze on this
+		// core - and did not fix the warm reset either.  Reverted 2026-09-09.
+		if (!this->latency) this->latency = 12;
 	}
 	else
 	{
