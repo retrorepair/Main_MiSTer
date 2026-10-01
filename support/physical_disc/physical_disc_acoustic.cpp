@@ -680,6 +680,34 @@ static int mirror_aborted(void)
 	return !mir.on || mir.held || mir.phys_session || mir.dev_fd < 0;
 }
 
+// Follow the original drive's CLV speed, changing it as the gesture asks.
+//
+// The speed was being set once at open and never touched, which left the mirror
+// at a constant 1x. For a Mega CD that is right -- it is a 1x drive and never
+// anything else -- but a PlayStation reads data at 2x and plays audio at 1x, and
+// the spindle ramping between the two is a large part of how one sounds. Nothing
+// was reproducing that at all.
+//
+// Measured on the drive here, SET CD SPEED is genuinely honoured: raw-read
+// throughput came out at 0.68x, 1.15x, 2.49x and 5.11x of real time for
+// requested 1x, 2x, 4x and max. The absolute figures sit below the request
+// because each read is a separate command, but it scales, and the ramp between
+// settings is audible -- which is the entire point.
+static void apply_speed(double mult)
+{
+	static int applied = -1;
+	if (mir.dev_fd < 0 || mult < 0.5) return;
+
+	int want = (int)(mult + 0.5);
+	if (want < 1)  want = 1;
+	if (want > 12) want = 12;
+	if (want == applied) return;
+
+	ioctl(mir.dev_fd, CDROM_SELECT_SPEED, want);
+	applied = want;
+	acu_log("  spindle to %dx\n", want);
+}
+
 // ------------------------------------------------------------- grime -------
 //
 // PHYSICAL_DISC_ACOUSTIC_GRIME, 0..10, 0 = a factory-fresh mechanism.
@@ -742,19 +770,45 @@ static void grime_resume(int lba)
 	mirror_play(mir.dev_fd, lba, blk);
 }
 
-// A long, laboured traverse -- the thing an old console actually sounds like
-// when it goes looking for something.
+// Move the head to `to_lba`, taking about as long as the original mechanism
+// would have taken, and making as much noise on the way as it really would.
 //
-// One big PLAY to the destination is wrong for this: the drive services it with
-// a single fast coordinated move, 1385 ms of smooth swoosh on the drive here,
-// and then silence. A dry sled grinding across a disc is continuous, and to get
-// that the sled motor must never be allowed to stop.
+// The history of this function is worth keeping, because three plausible ideas
+// were wrong and the measurements say why:
 //
-// So march the head across in steps that are each comfortably past the
-// lens-jump range -- below about 0.04 mm the objective covers it and the sled
-// never moves at all -- but small enough that the next step is issued before
-// the previous one has settled. Back to back they run together into one
-// continuous grind instead of a series of discrete clunks.
+//  - A fine staircase (many small steps) judders. Every SCSI positioning
+//    command is a move-and-settle: the firmware runs the sled to the address
+//    and stops it dead. Back-to-back steps are not continuous motion, they are
+//    one settle after another -- a 24 Hz buzz at SEEK's cost, a row of clunks
+//    at PLAY's.
+//  - One single traverse is too short. The drive crosses the whole disc in
+//    693 ms where a Mega CD seek is up to 1.66 s.
+//  - Overshoot ping-pong cannot fill a duration predictably: each pass covers
+//    the whole distance plus an overshoot, so one pass is too short and two are
+//    too long, which produced the 1.5-2x overruns that were heard as a seek
+//    against the wrong thing on screen.
+//
+// What works is to solve for the step count from the drive's measured cost
+// curve. SEEK(10) here costs about a fixed 150 ms plus 0.0019 ms per sector --
+// fitted to 28 ms at 500 sectors, 188 at 20000, 264 at 60000, 392 at 150000 and
+// 693 at 280000. The fixed part dominates, so:
+//
+//     total = N*FIXED + PER_SECTOR*distance   =>   N = (total - travel)/FIXED
+//
+// N is few (one to eight), each step is a substantial monotonic traverse toward
+// the target, and the duration comes out right.
+// Fitted to the two measurements that matter for long moves: 261 ms at 60000
+// sectors and 693 ms at 280000.
+#define SEEK_FIXED_MS        143.0
+#define SEEK_PER_SECTOR_MS   0.00196
+#define DRIVE_MIN_SEEK_MS    200.0
+
+// Every grind ends with a settle seek, an arrival seek and a PLAY to put the
+// spindle back to 1x. All three land inside the duration being budgeted, and
+// ignoring them is why a 1339 ms seek took 2564 ms: the steps filled the budget
+// and then the tail ran past it.
+#define SEEK_TAIL_MS         570.0
+
 static void grime_grind(int from_lba, int to_lba, double total_ms)
 {
 	if (mir.dev_fd < 0 || mir.phys_session) return;
@@ -763,112 +817,51 @@ static void grime_grind(int from_lba, int to_lba, double total_ms)
 	double r1   = media_radius_mm(to_lba);
 	double span = r1 - r0;
 	double dist = span < 0 ? -span : span;
-	if (dist < 0.30) return;               // too short to be worth grinding
 
-	// Two competing constraints. Each step must clear the lens-jump range or
-	// the sled does not move and the step is silent, which caps how finely a
-	// given distance can be divided. But the steps must also come close enough
-	// together that the motor never stops, or it is a row of separate clunks
-	// rather than a grind -- a 1.6 mm seek stretched over 945 ms in six steps
-	// is 157 ms of silence between each, which is what the first attempt did.
-	//
-	// So take the smaller of the two counts and let the traverse finish early
-	// if the distance simply cannot fill the time. A short seek being short is
-	// correct anyway.
-	// A single long seek IS the grind, and trying to synthesise one out of
-	// small steps was simply the wrong idea.
-	//
-	// Every SCSI positioning command is a move-and-settle: the firmware runs
-	// the sled to the address and stops it. Issuing them back to back does not
-	// produce continuous motion, it produces one settle after another -- at
-	// SEEK's 42 ms that is a 24 Hz buzz, and at PLAY's 200 ms a row of clunks.
-	// Two rounds of judder came from chopping up the one thing that actually
-	// moves the sled smoothly: the drive's own coordinated traverse, measured
-	// at 1385 ms unbroken for 20 mm on the drive here.
-	//
-	// So make the traverses FEWER and LONGER, not more and shorter. A worn
-	// mechanism overshoots and has to come back, and each of those passes is a
-	// full continuous grind in its own right.
-	// How many traverses it takes to fill the time the ORIGINAL drive would
-	// have spent on this seek.
-	//
-	// The model's figure is sourced: a Mega CD seek is a 160 ms base plus up to
-	// 1.5 s across the disc. This drive crosses the whole disc in 693 ms --
-	// measured, SEEK(10) latency, which rises close to linearly with distance
-	// (28 ms at 500 sectors, 188 at 20000, 392 at 150000, 693 at 280000). One
-	// traverse is therefore well short of a Mega CD seek, and the honest way to
-	// make up the difference is to cross the distance as many times as it takes.
-	//
-	// Deriving it this way rather than from invented distance thresholds means
-	// correcting the model's timing actually changes what comes out of the
-	// drive, which it previously did not.
 	double span_sectors = (double)(to_lba > from_lba ? to_lba - from_lba
 	                                                : from_lba - to_lba);
-	double traverse_ms  = 30.0 + 2.4 * (span_sectors / 1000.0);
-	if (traverse_ms < 40.0) traverse_ms = 40.0;
 
-	// Fill that time exactly -- never exceed it. Running to a fixed pass count
-	// overran badly: a Mega CD seek models at 1805 ms, but four passes with a
-	// random 40-130 ms settle between each came to about 3.2 s, so the mirror
-	// was still grinding after the emulated drive had finished and playback had
-	// resumed. That is heard as a long seek during playback, which no real drive
-	// does. Those settles were also the jitter: audible gaps mid-traverse, where
-	// a real sled crossing the disc does not stop on the way.
-	// This drive cannot make a sled move in less than about 200 ms -- measured,
-	// SEEK(10): 28 ms for 500 sectors but 216 ms by 3000, so there is a large
-	// fixed cost the moment the sled is involved at all. A short Mega CD seek is
-	// 286 ms, which does not fit even one traverse plus the final arrival, so
-	// trying to grind one produced 1278 ms and sounded exactly like a cross-disc
-	// transition. A short seek is one short move; that is all it ever was.
-	#define DRIVE_MIN_TRAVERSE_MS 200.0
+	// Below the lens-jump range the sled does not move at all, so there is
+	// nothing to make noise with.
+	if (dist < 0.05) { grime_resume(to_lba); return; }
 
-	if (total_ms < DRIVE_MIN_TRAVERSE_MS * 2.0) {
+	// This drive cannot make a sled move in under about 200 ms. A short seek
+	// models at less than twice that, so it cannot be subdivided at all without
+	// overrunning -- and a short seek played as a long one is what made a 0.6 mm
+	// hop sound identical to a cross-disc transition. A short seek is one move.
+	if (total_ms < DRIVE_MIN_SEEK_MS * 2.0 || dist < 0.30) {
 		mirror_seek(mir.dev_fd, to_lba);
 		grime_resume(to_lba);
 		return;
 	}
 
-	double deadline = clock_ms() + total_ms;
+	double travel_ms = SEEK_PER_SECTOR_MS * span_sectors;
+	int    steps     = (int)((total_ms - travel_ms - SEEK_TAIL_MS) / SEEK_FIXED_MS + 0.5);
+	if (steps < 1) steps = 1;
+	if (steps > 8) steps = 8;
+
 	int surge = grime_level() >= 8 && !mir.no_read;
 
-	// Stop when the NEXT traverse would not fit, rather than when the deadline
-	// has already passed: a traverse cannot be interrupted once issued, so
-	// checking afterwards guarantees an overrun of a whole move.
-	double cost = traverse_ms > DRIVE_MIN_TRAVERSE_MS ? traverse_ms : DRIVE_MIN_TRAVERSE_MS;
-	for (int i = 0; i < 10 && clock_ms() + cost < deadline; i++) {
-		if (!mir.on || mir.held || mir.phys_session || mir.dev_fd < 0) break;
-
-		// Overshoot past the target, alternating side and shrinking each time,
-		// so it closes in rather than flailing.
-		//
-		// The floor matters more than the proportional part. Most in-game seeks
-		// are short hops within the data track, and a short hop is 30 ms of
-		// near-silence on this drive however faithfully it is reproduced. The
-		// overshoot is what turns one into real audible travel, so it scales
-		// with the grime level rather than only with the distance.
-		// Overshoot PROPORTIONAL to the distance, with only a token floor.
-		//
-		// This had a large wear-driven floor -- about 7.9 mm at grime 7 whatever
-		// the seek -- added to make short hops audible. It worked, and it
-		// destroyed the thing that actually matters. Measured on hardware: a
-		// 0.6 mm hop took 1506 ms against the 243 ms the model asked for, and
-		// STEP and SLEW were both coming out between 1.5 and 2.3 seconds. So a
-		// short seek sounded exactly like a cross-disc transition.
-		//
-		// The long seek was never missing. It had no contrast, because
-		// everything else was just as long.
-		double over = (dist * (0.35 + grime_level() * 0.03) + 0.3) / (i + 1);
-		if (i & 1) over = -over;
-		int at = lba_offset_mm(to_lba, span > 0 ? over : -over);
-
+	for (int i = 1; i <= steps; i++) {
+		if (mirror_aborted()) break;
+		int at = media_lba_at_radius(r0 + span * ((double)i / steps));
 		mirror_seek(mir.dev_fd, at);
 
-		// Spindle surge: a raw read spins the drive up hard, and dropping back
-		// lets it fall. Failure is fine -- we want the spin-up, not the bytes.
+		// Spindle surge: a raw read spins the drive up hard and dropping back
+		// lets it fall, which gives a labouring whine rather than a level tone.
+		// Failure is fine -- the spin-up is the point, not the bytes.
 		if (surge) mirror_read_raw(mir.dev_fd, at, 24, 700);
 	}
 
-	mirror_seek(mir.dev_fd, to_lba);                // finally arrives
+	// A worn mechanism overshoots at the end and has to come back. ONE
+	// correction: this is the settle, not the seek, and a sequence of them is
+	// what made every seek sound the same length as every other.
+	if (grime_level() >= 4 && !mirror_aborted()) {
+		double over = dist * 0.15 + 0.4;
+		mirror_seek(mir.dev_fd, lba_offset_mm(to_lba, span > 0 ? over : -over));
+	}
+
+	mirror_seek(mir.dev_fd, to_lba);
 
 	// SEEK stops audio playback outright (verified: PLAYING -> DONE), so hand
 	// the spindle back to a true 1x before the mirror carries on.
@@ -972,6 +965,17 @@ static void play_gesture(const gesture_t *g)
 	int resync   = (g->kind == GEST_SPINUP || g->kind == GEST_SWEEP ||
 	                g->kind == GEST_PARK);
 	int target   = amplified_mirror_lba(g->lba, resync);
+
+	// Follow the modelled spindle speed; a change here IS the audible ramp.
+	if (g->speed > 0.0) apply_speed(g->speed);
+
+	// No staleness test any more. There was one, dropping a move older than
+	// 1.2 s on the grounds that a late seek is worse than no seek, and it threw
+	// away the audio lock-on and then two seeks out of five behind the boot
+	// sweep. It was also redundant: coalescing already merges queued seeks into
+	// one movement to the NEWEST target, so a seek cannot be superseded by the
+	// time it is played. Lateness is handled by going to the right place, not by
+	// refusing to go.
 
 	// `from` must be where the head actually IS, which once a gain is applied
 	// is not the faithful mapping of the game's previous LBA.
@@ -1411,11 +1415,29 @@ static void *worker_main(void *arg)
 			}
 		}
 
+		// One-slot pushback. Coalescing seeks has to read ahead past them, and
+		// when it meets a real event it must be able to put it back: the model's
+		// queue only pops, and dropping an event there is how the lock-on went
+		// missing twice already.
+		static gesture_t stash;
+		static int       has_stash = 0;
+
 		gesture_t g;
-		if (!acu_model_poll(&model, &g)) {
+		if (has_stash) {
+			g         = stash;
+			has_stash = 0;
+		}
+		else if (!acu_model_poll(&model, &g)) {
 			sleep_ms(10);
 			continue;
 		}
+
+		// The spindle follows the model's CURRENT speed, every iteration, not
+		// just when a gesture happens to be played. Stream gestures are mostly
+		// collapsed away, so hanging the speed off them meant one ramp in
+		// seventy seconds on a PlayStation, which alternates 1x audio and 2x
+		// data constantly. apply_speed() is a no-op when nothing has changed.
+		apply_speed(model.stream_mult);
 
 		// Collapse position updates, but never collapse movement.
 		//
@@ -1447,10 +1469,52 @@ static void *worker_main(void *arg)
 			#define IS_UPDATE(k) ((k) == GEST_STREAM || (k) == GEST_JUMP || \
 			                      (k) == GEST_HOLD)
 
+			#define IS_SEEK(k) ((k) == GEST_SLEW || (k) == GEST_STEP)
+
 			gesture_t next;
 			int collapsed = 0;
 
-			if (IS_UPDATE(g.kind)) {
+			// COALESCE consecutive seeks into one movement to the final place.
+			//
+			// This is the fix for a problem no amount of policy tweaking solved:
+			// 76 moves in 70 seconds were being discarded as stale, because a
+			// gesture costs one to two seconds of real drive time and the model
+			// emits them faster than that. Replaying a history cannot keep up
+			// with a mechanism that needs 200 ms per move, so the mirror ran
+			// permanently over a second late and a seek was heard against the
+			// wrong thing on screen.
+			//
+			// The drive can only be in one place, so a queue of seeks is not
+			// several movements -- it is one movement, to wherever the last of
+			// them points. Summing their durations keeps what matters about a
+			// burst, which is that a transition takes a long time; it just
+			// arrives as one continuous grind rather than four late ones. That
+			// is also closer to what the mechanism does than four discrete
+			// traverses ever was.
+			if (IS_SEEK(g.kind)) {
+				double total = g.dur_ms;
+				int    n     = 0;
+				while (acu_model_poll(&model, &next)) {
+					if (IS_SEEK(next.kind)) {
+						total += next.dur_ms;
+						g      = next;          // newest target wins
+						n++;
+						continue;
+					}
+					if (IS_UPDATE(next.kind)) { n++; continue; }
+					// A real event: must not be lost, so stash it for the next
+					// iteration rather than dropping it on the floor.
+					stash     = next;
+					has_stash = 1;
+					break;
+				}
+				if (n) {
+					g.dur_ms = total > 6000.0 ? 6000.0 : total;
+					acu_log("coalesced %d into one %s of %0.0fms\n",
+					        n, acu_gesture_name(g.kind), g.dur_ms);
+				}
+			}
+			else if (IS_UPDATE(g.kind)) {
 				// Scan forward for a real event. If one is queued it takes
 				// priority over any number of stale position updates; if not,
 				// the newest update is the only one that means anything.
@@ -1461,7 +1525,7 @@ static void *worker_main(void *arg)
 				}
 			}
 			if (collapsed)
-				acu_log("collapsed %d stale update%s, now %s\n", collapsed,
+				acu_log("merged %d position update%s, now %s\n", collapsed,
 				        collapsed == 1 ? "" : "s", acu_gesture_name(g.kind));
 		}
 

@@ -306,3 +306,47 @@ Deriving the count this way rather than from invented distance thresholds is wha
 makes correcting the model's timing actually change what comes out of the drive.
 Measured afterwards: 3.6 s of continuous sled movement on a data-to-audio
 transition.
+
+## Making a gesture take the right amount of time
+
+The model says how long the original drive would have spent. Getting the mirror
+to agree took several wrong turns, and the measurements are worth keeping:
+
+* **A fine staircase judders.** Every SCSI positioning command is a
+  move-and-settle: the firmware runs the sled to the address and stops it dead.
+  Back-to-back steps are not continuous motion, they are one settle after
+  another -- a 24 Hz buzz at `SEEK`'s cost, a row of clunks at `PLAY`'s.
+* **One traverse is too short.** The drive crosses the whole disc in 693 ms
+  where a Mega CD seek runs to 1.66 s.
+* **Overshoot ping-pong cannot fill a duration.** Each pass covers the whole
+  distance plus an overshoot, so one pass is short and two are long. That is
+  where 1.5-2x overruns came from, and an overrun is heard as a seek against the
+  wrong thing on screen.
+
+What works is solving for the step count from the drive's measured cost curve.
+`SEEK(10)` here costs about **143 ms fixed plus 0.00196 ms per sector** (fitted to
+261 ms at 60000 sectors and 693 ms at 280000). The fixed part dominates, so
+
+    total = N*FIXED + PER_SECTOR*distance + TAIL   =>   N = (total - travel - TAIL)/FIXED
+
+and `N` is the knob. `TAIL` is ~570 ms and matters: every grind ends with a
+settle seek, an arrival seek and a `PLAY` to restore 1x, and all three land inside
+the budget. Ignoring them is why a 1339 ms seek took 2564 ms -- the steps filled
+the budget and then the tail ran past it.
+
+Measured after: SPINDOWN 1.00x, cross-disc seek 1.09x, lock-on 1.06x of what the
+model asked for, against 1.9-4.5x before.
+
+### Two things deliberately NOT done
+
+**No staleness test.** There was one, dropping moves older than 1.2 s on the
+grounds that a late seek is worse than none. It threw away the audio lock-on
+(which follows its own seek and is therefore late by construction) and two seeks
+in five behind the boot sweep. It was also redundant: coalescing merges queued
+seeks into one movement to the newest target, so a seek cannot be superseded by
+the time it is played. Lateness is handled by going to the right place.
+
+**Seeks are coalesced, not replayed.** A queue of seeks is not several movements,
+it is one movement to wherever the last of them points, because the drive can
+only be in one place. Their durations sum, so a transition still takes a long
+time; it arrives as one continuous grind instead of four late ones.

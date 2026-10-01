@@ -176,6 +176,7 @@ static void emit(acu_model_t *m, const gesture_t *g)
 	}
 
 	m->out[m->out_tail] = *g;
+	m->out[m->out_tail].born_ms = m->now_ms;
 	m->out_tail = (m->out_tail + 1) & ACU_OUT_MASK;
 }
 
@@ -208,6 +209,7 @@ static void emit_move(acu_model_t *m, int from, int to)
 	g.radial_mm = cd_geom_radial_delta_mm(from, to);
 	g.dur_ms    = acu_model_seek_ms(d, from, to);
 	g.rpm       = cd_geom_rpm(to, m->stream_mult);
+	g.speed     = m->stream_mult;
 
 	if (g.turns <= d->lens_jump_turns) {
 		// The objective lens covers this on its own: the sled motor never
@@ -245,6 +247,7 @@ static void emit_stream(acu_model_t *m, double now_ms, int lba, double mult, dou
 	g.lba            = lba;
 	g.rpm            = cd_geom_rpm(lba, mult);
 	g.rate_sectors_s = rate;
+	g.speed          = mult;
 	g.audio          = audio;
 	g.sectors        = (int)(rate * 0.25);   // re-evaluated four times a second
 	if (g.sectors < 1) g.sectors = 1;
@@ -263,6 +266,7 @@ static void simple(acu_model_t *m, gesture_kind_t k, int lba, double dur, double
 	g.lba      = lba;
 	g.dur_ms   = dur;
 	g.rpm      = cd_geom_rpm(lba, mult);
+	g.speed    = mult;
 	emit(m, &g);
 }
 
@@ -278,6 +282,7 @@ void acu_model_event(acu_model_t *m, double now_ms, pd_acoustic_event_t ev, int 
 {
 	const acu_drive_t *d = &m->drive;
 	if (lba < 0) lba = 0;
+	m->now_ms = now_ms;
 	m->last_event_ms = now_ms;
 
 	switch (ev) {
@@ -451,6 +456,7 @@ void acu_model_event(acu_model_t *m, double now_ms, pd_acoustic_event_t ev, int 
 
 void acu_model_tick(acu_model_t *m, double now_ms)
 {
+	m->now_ms = now_ms;
 	const acu_drive_t *d = &m->drive;
 	double idle = now_ms - m->last_event_ms;
 

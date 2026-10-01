@@ -33,6 +33,8 @@ typedef struct {
 	double radial_mm;       // sled travel
 	int    stages;          // sled sub-moves for a slew (coarse then fine)
 	double rate_sectors_s;  // for STREAM: how fast the head creeps
+	double speed;           // CLV multiple the original drive runs at here
+	double born_ms;         // when the model emitted this, for staleness
 	int    sectors;         // for STREAM: how far it runs before re-evaluating
 	int    audio;           // STREAM is Red Book audio, not a data read
 } gesture_t;
@@ -66,6 +68,7 @@ typedef struct {
 	double stream_anchor_ms;
 	double last_event_ms;
 	double last_emit_ms;
+	double now_ms;            // latest timestamp the model has been given
 	int    pending_stream;
 	int    holding;
 	int    just_moved;        // repositioned and not yet started reading there
