@@ -8,6 +8,7 @@
 #include "../../shmem.h"
 #include "../chd/mister_chd.h"
 #include "../physical_disc/physical_disc.h"
+#include "../physical_disc/physical_disc_acoustic.h"
 
 #define SHMEM_ADDR  0x31000000
 
@@ -321,6 +322,8 @@ int satcdd_t::Load(const char *filename)
 	//fileTYPE *fd_img;
 
 	Unload();
+
+	physical_disc_acoustic_set_profile(PD_ACU_PROFILE_SATURN);
 
 	const char *ext = filename + strlen(filename) - 4;
 	if (!strcmp(filename, PHYSICAL_DISC_SENTINEL))
@@ -686,6 +689,7 @@ void satcdd_t::CommandExec() {
 	case SATURN_COMM_TOC:
 		this->toc_pos = 0;
 		this->read_toc = true;
+		physical_disc_acoustic_event(PD_ACU_TOC, 0, 0);
 		this->speed = comm[10] == 1 ? 1 : 2;
 
 #ifdef SATURN_DEBUG
@@ -697,6 +701,7 @@ void satcdd_t::CommandExec() {
 
 	case SATURN_COMM_STOP:
 		this->stop_pend = true;
+		physical_disc_acoustic_event(PD_ACU_STOP, this->lba, 0);
 		this->read_pend = false;
 
 #ifdef SATURN_DEBUG
@@ -716,6 +721,11 @@ void satcdd_t::CommandExec() {
 
 
 		if (this->toc.phys) physical_disc_seek_hint(this->lba);
+
+		// Reposition before a read. Unlike the physical-disc hint above this
+		// fires for image-backed discs too, which is where the mirror is
+		// actually needed.
+		physical_disc_acoustic_event(PD_ACU_SEEK, this->lba, 0);
 
 		this->track = this->toc.GetTrackByLBA(this->seek_lba);
 		this->index = this->toc.GetIndexByLBA(this->track, this->seek_lba);
@@ -741,6 +751,7 @@ void satcdd_t::CommandExec() {
 
 	case SATURN_COMM_PAUSE:
 		this->pause_pend = true;
+		physical_disc_acoustic_event(PD_ACU_PAUSE, this->lba, 0);
 		this->seek_pend = false;
 		this->read_pend = false;
 
@@ -759,6 +770,8 @@ void satcdd_t::CommandExec() {
 		this->lba = fad - 150;
 
 		if (this->toc.phys) physical_disc_seek_hint(this->lba);
+
+		physical_disc_acoustic_event(PD_ACU_SEEK, this->lba, 0);
 
 		this->track = this->toc.GetTrackByLBA(this->seek_lba);
 		this->index = this->toc.GetIndexByLBA(this->track, this->seek_lba);
@@ -1307,11 +1320,15 @@ uint32_t satcdd_t::DataSectorCalcCRC(uint8_t* buf, int len)
 
 void satcdd_t::ReadData(uint8_t *buf)
 {
-	int offs = 0; 
+	int offs = 0;
 
 	if (this->toc.tracks[this->track].type)
 	{
 		int lba_ = this->lba >= 0 ? this->lba : 0;
+
+		// One data sector off the disc. `speed` is the 1x/2x the game asked
+		// for, which the mirror uses to pace the head.
+		physical_disc_acoustic_event(PD_ACU_READ, lba_, 1);
 		if (this->toc.phys)
 		{
 
@@ -1352,6 +1369,10 @@ void satcdd_t::ReadData(uint8_t *buf)
 int satcdd_t::ReadCDDA(uint8_t *buf, int first)
 {
 	int sec_offs = first ? 0 : 1;
+
+	// Red Book audio always runs at 1x, so the mirror creeps rather than
+	// hunting the way a data read does.
+	physical_disc_acoustic_event(PD_ACU_PLAY, this->chd_audio_read_lba, 2 - sec_offs);
 
 	uint8_t *dest = buf;
 	if (this->toc.phys)

@@ -9,6 +9,7 @@
 
 #include "../chd/mister_chd.h"
 #include "../physical_disc/physical_disc.h"
+#include "../physical_disc/physical_disc_acoustic.h"
 #include "pcecd.h"
 
 #define PCECD_DATA_IO_INDEX 2
@@ -254,6 +255,7 @@ int pcecdd_t::LoadCUE(const char* filename) {
 
 int pcecdd_t::Load(const char *filename)
 {
+	physical_disc_acoustic_set_profile(PD_ACU_PROFILE_PCECD);
 	char subcode_name[256];
 
 	Unload();
@@ -441,6 +443,8 @@ void pcecdd_t::Update() {
 			//SectorSend(0);
 		}
 
+		physical_disc_acoustic_event(PD_ACU_READ, this->lba, 1);
+
 		this->cnt--;
 
 		if (!this->cnt) {
@@ -480,6 +484,9 @@ void pcecdd_t::Update() {
 		}
 
 		this->index = GetTrackByLBA(this->lba, &this->toc);
+
+		// CDDA playback: 1x, head creeping outward one sector at a time.
+		physical_disc_acoustic_event(PD_ACU_PLAY, this->lba, 1);
 
 		DISKLED_ON;
 
@@ -702,6 +709,9 @@ void pcecdd_t::CommandExec() {
 		}
 		printf("seek time ticks: %d\n", this->latency);
 
+		// A data read: the drive repositions, then streams `cnt` sectors.
+		physical_disc_acoustic_event(PD_ACU_SEEK, new_lba, 0);
+
 		this->lba = new_lba;
 		this->cnt = cnt_;
 
@@ -785,6 +795,8 @@ void pcecdd_t::CommandExec() {
 		if (this->toc.phys && !this->toc.tracks[index].type)
 			physical_disc_seek_hint(new_lba);
 
+		physical_disc_acoustic_event(PD_ACU_SEEK, new_lba, 0);
+
 		this->CDDAStart = new_lba;
 		this->CDDAEnd = this->toc.end;
 		this->CDDAMode = comm[1];
@@ -850,6 +862,7 @@ void pcecdd_t::CommandExec() {
 
 	case PCECD_COMM_PAUSE: {
 		this->state = PCECD_STATE_PAUSE;
+		physical_disc_acoustic_event(PD_ACU_PAUSE, this->lba, 0);
 
 		SendStatus(MAKE_STATUS(PCECD_STATUS_GOOD, 0));
 	}

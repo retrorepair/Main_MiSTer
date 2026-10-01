@@ -6,6 +6,7 @@
 
 #include "../../file_io.h"
 #include "../physical_disc/physical_disc.h"
+#include "../physical_disc/physical_disc_acoustic.h"
 #include "../physical_disc/physical_disc_launch.h"
 #include "../../user_io.h"
 #include "../../spi.h"
@@ -576,6 +577,17 @@ void psx_read_cd(uint8_t *buffer, int lba, int cnt)
 			{
 				if (lba >= toc.tracks[i].start && lba <= toc.tracks[i].end)
 				{
+					// Report the access regardless of how the disc is backed.
+					// The seek hint below only fires for a real disc, but the
+					// mirror is needed exactly when it is NOT a real disc --
+					// and for a .cue/.bin there was previously no signal at
+					// all, so image-backed PSX play made no noise whatsoever.
+					// The fake 150-sector pregap shifts every LBA up, so take
+					// it back off to get the disc address.
+					physical_disc_acoustic_event(
+						toc.tracks[i].type ? PD_ACU_READ : PD_ACU_PLAY,
+						lba - toc.tracks[0].indexes[1], cnt);
+
 					if (toc.phys)
 					{
 
@@ -916,6 +928,8 @@ int psx_mount_cd(int f_index, int s_index, const char *filename)
 {
 	static char last_dir[1024] = {};
 
+	physical_disc_acoustic_set_profile(PD_ACU_PROFILE_PSX);
+
 	int loaded = 0;
 	int phys = !strcmp(filename, PHYSICAL_DISC_SENTINEL);
 	physical_disc_swap_enable(0);   
@@ -1045,6 +1059,12 @@ int psx_mount_cd(int f_index, int s_index, const char *filename)
 
 			mount_cd(toc.end*CD_SECTOR_LEN, s_index);
 			loaded = 1;
+
+			// Disc accepted: lid shut, spin up, servo sweep, then back to the
+			// lead-in for the TOC. This is the PlayStation's start-up noise,
+			// and it is the part of the sound nobody was getting before.
+			physical_disc_acoustic_event(PD_ACU_TRAY_CLOSE, 0, 0);
+			physical_disc_acoustic_event(PD_ACU_TOC, 0, 0);
 
 
 			if (phys) physical_disc_swap_enable(1);

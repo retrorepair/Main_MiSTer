@@ -1,0 +1,113 @@
+# Acoustic mirroring
+
+Drives a spare disc in the USB drive so it makes the noises the original
+console's drive would have made for the disc activity the core is really
+performing.
+
+Enable with `PHYSICAL_DISC_ACOUSTIC=1` in `MiSTer.ini`, and put a disc you
+don't care about in the drive. `PHYSICAL_DISC_ACOUSTIC_PROFILE` pins the
+imitated mechanism (`0` follows whichever core is running, then `1` PSX,
+`2` Mega CD, `3` Saturn, `4` PC Engine CD, `5` 3DO, `6` CD-i, `7` Neo Geo CD).
+
+## How it is put together
+
+    cores  ──event──▶  acoustic_model  ──gesture──▶  physical_disc_acoustic
+                       (pure logic)                  (SCSI, thread)
+                            │
+                       cd_geometry
+                       (disc physics)
+
+**`cd_geometry`** is the disc itself. A CD is a constant-linear-density
+spiral, so sector number maps to radius as a square root:
+
+    r(lba) = sqrt(r_inner^2 + lba * pitch * sector_length / pi)
+
+Everything else is derived from that — how many sectors are in one revolution
+at a given radius, the CLV spindle speed, and how many spiral turns lie
+between two LBAs. The model is checked against the drive measurements Dave
+Shadoff took for `support/pcecd/seektime.cpp`; it reproduces his whole
+sectors-per-revolution table to within 0.13 of a sector (`tests/acoustic`).
+
+**`acoustic_model`** keeps a model of the original mechanism — where the sled
+is, whether the spindle is running, what it is doing — and turns core activity
+into physical *gestures*:
+
+| gesture  | what the original drive is doing                        |
+|----------|---------------------------------------------------------|
+| JUMP     | objective lens hops a few turns; the sled never moves    |
+| STEP     | one short sled move                                      |
+| SLEW     | long coarse-then-fine sled travel, 2 or 3 stages         |
+| STREAM   | sustained read, head creeping outward under CLV          |
+| HOLD     | spindle turning, head parked on track                    |
+| SPINUP / SPINDOWN / SWEEP / PARK | start-up, shutdown, boot calibration, tray |
+
+The important distinction is JUMP vs STEP vs SLEW. A CD servo services a small
+move by tilting the lens alone — the sled motor never runs and there is
+**nothing to hear**. Only past roughly 32 spiral turns does the sled engage.
+Treating every small move as a seek is what makes a naive mirror sound like a
+hard disk rather than a console.
+
+**`physical_disc_acoustic`** replays gestures on the real drive. Game LBAs are
+mapped onto the mirror disc by *fraction of radial stroke*, not by sector
+number, so sled travel is proportional and the mirror's own CLV spindle
+reproduces the same pitch glide. It copes with a short CD-R or a DVD, which
+have the same ~24–58 mm program area but very different sector counts.
+
+## Where the activity comes from
+
+Every CD core reports what its emulated drive is doing. This matters more than
+anything else in here: previously the only signal was a single LBA per CHD
+sector read, so `.cue`/`.bin` images produced **no sound at all**, and a CDDA
+stream was indistinguishable from a random-access data read.
+
+| core        | reported                                                     |
+|-------------|--------------------------------------------------------------|
+| Mega CD     | seek, per-sector data vs audio, scan, pause, resume, stop, tray open/close, TOC |
+| Neo Geo CD  | as Mega CD (shares `cdd_t`), own slower profile               |
+| Saturn      | read and seek commands, data sectors, CDDA, TOC, stop, pause  |
+| PC Engine CD| READ6 seek + sectors, CDDA playback, SAPSP seek, pause        |
+| 3DO         | read command seek, data sectors, pause/stop                   |
+| CD-i        | read bursts with their real sector count                      |
+| PSX         | every read with its burst count and data/audio flag, mount    |
+
+`mister_chd_read_sector()` no longer hints. All six of its callers now report
+at the right level, and hinting again from the storage layer would double-count
+every sector and — because the second hint lands one sector *behind* the
+modelled head — fabricate a seek that never happened.
+
+## Tests
+
+No MiSTer needed; these are pure logic.
+
+```bash
+g++ -O2 -o tgeom tests/acoustic/test_geometry.cpp support/physical_disc/cd_geometry.cpp -lm && ./tgeom
+g++ -O2 -o tsim tests/acoustic/sim_timeline.cpp support/physical_disc/acoustic_model.cpp support/physical_disc/cd_geometry.cpp -lm && ./tsim
+```
+
+`test_geometry` checks the disc physics against Shadoff's measured table and
+round-trips the LBA/radius conversion. `sim_timeline` runs a PSX boot-and-load
+trace through the model and prints the gesture timeline, the radial mapping,
+and the modelled seek times for every profile.
+
+## Tuning
+
+The per-console numbers are all in one table at the top of
+`acoustic_model.cpp` — speeds, the lens-jump and short-seek thresholds, settle
+and stroke times, spin-up, spin-down, read-ahead. They are meant to be adjusted
+by ear without touching any logic. The PC Engine row is Shadoff's measured
+data; the others are scaled from each mechanism's rated access time and are a
+starting point rather than gospel.
+
+## Known limits
+
+* The mirror is disabled whenever the real drive is busy serving a physical
+  disc, because that drive noise is already genuine. It does mean that in
+  physical-disc mode the rhythm you hear is the HPS prefetcher's, not the
+  console's. Shaping the real read pattern is possible but risks actual data
+  delivery, so it is deliberately not done here.
+* USB optical drives vary a lot in how quickly they service `READ(10)` and
+  whether they honour `SEEK(10)` or a speed change at all. There is a
+  seek-only fallback and a give-up path, both logged.
+* The drive cannot be made to take a specific time over a seek; the engine
+  issues the ops that move it the right distance and holds the remainder of
+  each gesture's slot so the *rhythm* is right.

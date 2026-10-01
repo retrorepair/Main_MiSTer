@@ -1,6 +1,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdint.h>
+#include <math.h>
 #include <climits>
 #include <fcntl.h>
 #include <unistd.h>
@@ -10,27 +11,44 @@
 #include <linux/cdrom.h>
 #include <scsi/sg.h>
 
+#include "../../cfg.h"
 #include "physical_disc.h"
 #include "physical_disc_acoustic.h"
+#include "acoustic_model.h"
+#include "cd_geometry.h"
 
-#define ACTIVITY_WINDOW_MS       600
-#define SPINDOWN_IDLE_MS         4000
-#define REPOSITION_JUMP          90
-#define IDLE_SEEK_PERIOD_MS      400
-#define RATE_SAMPLE_MS           200
-#define BURST_MIN                2
+// Replays the gestures acoustic_model produces on a spare disc in the USB
+// drive. The model says what the original mechanism would be doing; this file
+// is only concerned with making a real drive do the same physical thing at the
+// same time.
+
 #define BURST_MAX                32
 #define END_GUARD_SECTORS        32
 #define READ_FAIL_LIMIT          6
 #define REOPEN_FAIL_LIMIT        8
 #define SEEK_FAIL_LIMIT          4
-#define GAME_SPAN_MAX            360000
-#define DRIVE_SPEED_MIN          2
-#define DRIVE_SPEED_MAX          12
-#define DRIVE_SPEED_STEP         2
-#define SPEED_CHANGE_DEBOUNCE_MS 300
-#define SEEK_CMD_TIMEOUT_MS      4000
-#define READ_CMD_TIMEOUT_MS      4000
+#define CMD_TIMEOUT_MS           4000
+#define EVENT_RING               256
+
+// A console drive runs at 1x or 2x. Pinning the mirror drive low keeps its own
+// noise floor in the right place and stops it finishing every gesture before
+// the gesture is supposed to be over.
+#define MIRROR_SPEED_X           4
+
+// Program area of the media in the drive. Both CDs and DVDs run from roughly
+// 24 mm to 58 mm, so only the sector capacity differs.
+#define MEDIA_R_IN               24.0
+#define MEDIA_R_OUT              58.0
+#define MEDIA_FULL_CD            333000.0
+#define MEDIA_FULL_DVD           2298496.0
+#define DVD_SPAN_THRESHOLD       400000
+
+typedef struct {
+	pd_acoustic_event_t ev;
+	int lba;
+	int count;
+	double at_ms;
+} acu_event_t;
 
 typedef struct {
 	volatile int on;
@@ -38,16 +56,26 @@ typedef struct {
 	volatile int alive;
 	volatile int disabled_perm;
 	volatile int no_read;
-	volatile int game_pos;
-	volatile unsigned touch_count;
+	volatile int profile_req;
+
+	// Single producer (whichever core thread is running) / single consumer
+	// (the worker). Indices are free-running; only the difference matters.
+	acu_event_t ring[EVENT_RING];
+	volatile unsigned ring_head;
+	volatile unsigned ring_tail;
+	volatile unsigned dropped;
+
 	int dev_fd;
 	int disc_span;
 	int span_lo, span_hi;
+	double media_full;
+	double r_lo, r_hi;
+
 	pthread_t worker;
-} decoy_state_t;
+} mirror_state_t;
 
-static decoy_state_t decoy = { 0, 0, 0, 0, 0, 0, 0, -1, 0, 0, 0, 0 };
-
+static mirror_state_t mir;
+static acu_model_t model;
 static uint8_t burst_buf[BURST_MAX * 2048];
 
 static double clock_ms(void)
@@ -57,39 +85,54 @@ static double clock_ms(void)
 	return ts.tv_sec * 1000.0 + ts.tv_nsec / 1e6;
 }
 
-static int decoy_seek(int fd, int lba)
+static void sleep_ms(double ms)
+{
+	if (ms <= 0.0) return;
+	if (ms > 500.0) ms = 500.0;   // stay responsive to on/held/alive
+	struct timespec ts;
+	ts.tv_sec  = (time_t)(ms / 1000.0);
+	ts.tv_nsec = (long)((ms - ts.tv_sec * 1000.0) * 1e6);
+	nanosleep(&ts, NULL);
+}
+
+// ---------------------------------------------------------------- SCSI ----
+
+static int mirror_seek(int fd, int lba)
 {
 	uint8_t cdb[10] = { 0 };
 	uint8_t sense[32];
 	struct sg_io_hdr io;
 
-	cdb[0] = 0x2B;
+	cdb[0] = 0x2B;                      // SEEK(10)
 	cdb[2] = (lba >> 24) & 0xFF;
 	cdb[3] = (lba >> 16) & 0xFF;
 	cdb[4] = (lba >> 8) & 0xFF;
 	cdb[5] = lba & 0xFF;
 
 	memset(&io, 0, sizeof(io));
-	io.interface_id = 'S';
-	io.cmd_len = 10;
-	io.cmdp = cdb;
+	io.interface_id    = 'S';
+	io.cmd_len         = 10;
+	io.cmdp            = cdb;
 	io.dxfer_direction = SG_DXFER_NONE;
-	io.sbp = sense;
-	io.mx_sb_len = sizeof(sense);
-	io.timeout = SEEK_CMD_TIMEOUT_MS;
+	io.sbp             = sense;
+	io.mx_sb_len       = sizeof(sense);
+	io.timeout         = CMD_TIMEOUT_MS;
 
 	if (ioctl(fd, SG_IO, &io) < 0) return -1;
 	if (io.status || io.host_status || io.driver_status) return -2;
 	return 0;
 }
 
-static int decoy_read(int fd, int lba, int blocks)
+static int mirror_read(int fd, int lba, int blocks)
 {
 	uint8_t cdb[10] = { 0 };
 	uint8_t sense[32];
 	struct sg_io_hdr io;
 
-	cdb[0] = 0x28;
+	if (blocks < 1) blocks = 1;
+	if (blocks > BURST_MAX) blocks = BURST_MAX;
+
+	cdb[0] = 0x28;                      // READ(10)
 	cdb[2] = (lba >> 24) & 0xFF;
 	cdb[3] = (lba >> 16) & 0xFF;
 	cdb[4] = (lba >> 8) & 0xFF;
@@ -98,61 +141,86 @@ static int decoy_read(int fd, int lba, int blocks)
 	cdb[8] = blocks & 0xFF;
 
 	memset(&io, 0, sizeof(io));
-	io.interface_id = 'S';
-	io.cmd_len = 10;
-	io.cmdp = cdb;
+	io.interface_id    = 'S';
+	io.cmd_len         = 10;
+	io.cmdp            = cdb;
 	io.dxfer_direction = SG_DXFER_FROM_DEV;
-	io.dxfer_len = blocks * 2048;
-	io.dxferp = burst_buf;
-	io.sbp = sense;
-	io.mx_sb_len = sizeof(sense);
-	io.timeout = READ_CMD_TIMEOUT_MS;
+	io.dxfer_len       = blocks * 2048;
+	io.dxferp          = burst_buf;
+	io.sbp             = sense;
+	io.mx_sb_len       = sizeof(sense);
+	io.timeout         = CMD_TIMEOUT_MS;
 
 	if (ioctl(fd, SG_IO, &io) < 0) return -1;
 	if (io.status || io.host_status || io.driver_status) return -2;
 	return 0;
 }
 
-static void decoy_spin(int fd, int start)
+static void mirror_spin(int fd, int start)
 {
 	uint8_t cdb[6] = { 0 };
 	uint8_t sense[32];
 	struct sg_io_hdr io;
 
-	cdb[0] = 0x1B;
-	cdb[1] = 0x01;
+	cdb[0] = 0x1B;                      // START STOP UNIT
+	cdb[1] = 0x01;                      // immediate
 	cdb[4] = start ? 0x01 : 0x00;
 
 	memset(&io, 0, sizeof(io));
-	io.interface_id = 'S';
-	io.cmd_len = 6;
-	io.cmdp = cdb;
+	io.interface_id    = 'S';
+	io.cmd_len         = 6;
+	io.cmdp            = cdb;
 	io.dxfer_direction = SG_DXFER_NONE;
-	io.sbp = sense;
-	io.mx_sb_len = sizeof(sense);
-	io.timeout = SEEK_CMD_TIMEOUT_MS;
+	io.sbp             = sense;
+	io.mx_sb_len       = sizeof(sense);
+	io.timeout         = CMD_TIMEOUT_MS;
 
 	ioctl(fd, SG_IO, &io);
 }
 
-static void decoy_set_speed(int fd, int nx)
+// ------------------------------------------------------------ geometry ----
+
+// Radius of a given LBA on whatever disc is in the mirror drive. Unlike the
+// game side this has to cope with DVDs, so it works from the media's full
+// capacity rather than assuming Red Book.
+static double media_radius_mm(int lba)
 {
-	ioctl(fd, CDROM_SELECT_SPEED, nx);
+	double f = lba / mir.media_full;
+	if (f < 0.0) f = 0.0;
+	if (f > 1.0) f = 1.0;
+	return sqrt(MEDIA_R_IN * MEDIA_R_IN
+	            + f * (MEDIA_R_OUT * MEDIA_R_OUT - MEDIA_R_IN * MEDIA_R_IN));
 }
 
-static int project_lba(int game_lba)
+static int media_lba_at_radius(double r)
 {
-	int lo = decoy.span_lo, hi = decoy.span_hi;
-	if (hi <= lo) return lo;
-	if (game_lba < 0) game_lba = 0;
-	if (game_lba > GAME_SPAN_MAX) game_lba = GAME_SPAN_MAX;
-	int p = lo + (int)((int64_t)game_lba * (hi - lo) / GAME_SPAN_MAX);
-	if (p < lo) p = lo;
-	if (p > hi) p = hi;
-	return p;
+	if (r < MEDIA_R_IN)  r = MEDIA_R_IN;
+	if (r > MEDIA_R_OUT) r = MEDIA_R_OUT;
+	double f = (r * r - MEDIA_R_IN * MEDIA_R_IN)
+	           / (MEDIA_R_OUT * MEDIA_R_OUT - MEDIA_R_IN * MEDIA_R_IN);
+	return (int)(f * mir.media_full + 0.5);
 }
 
-static int decoy_acquire(void)
+// Map a game LBA onto the mirror disc so that the two heads sit at the same
+// FRACTION OF THE RADIAL STROKE. Mapping by sector number instead -- which is
+// what the previous implementation did -- gets both the sled travel and the
+// CLV spindle pitch wrong, because sector number goes as the square of radius.
+static int map_to_mirror(int game_lba)
+{
+	double r = cd_geom_radius_mm(game_lba);
+	double u = (r - CD_R_INNER_MM) / (CD_R_OUTER_MM - CD_R_INNER_MM);
+	if (u < 0.0) u = 0.0;
+	if (u > 1.0) u = 1.0;
+
+	int lba = media_lba_at_radius(mir.r_lo + u * (mir.r_hi - mir.r_lo));
+	if (lba < mir.span_lo) lba = mir.span_lo;
+	if (lba > mir.span_hi) lba = mir.span_hi;
+	return lba;
+}
+
+// --------------------------------------------------------- the device -----
+
+static int mirror_acquire(void)
 {
 	if (physical_disc_drive_busy()) return -1;
 
@@ -168,206 +236,334 @@ static int decoy_acquire(void)
 		struct cdrom_tocentry e;
 		if (ioctl(fd, CDROMREADTOCHDR, &hdr) < 0) { close(fd); continue; }
 		memset(&e, 0, sizeof(e));
-		e.cdte_track = CDROM_LEADOUT;
+		e.cdte_track  = CDROM_LEADOUT;
 		e.cdte_format = CDROM_LBA;
 		if (ioctl(fd, CDROMREADTOCENTRY, &e) < 0) { close(fd); continue; }
 
-		decoy.disc_span = e.cdte_addr.lba;
-		decoy.span_lo = 0;
-		decoy.span_hi = decoy.disc_span - BURST_MAX - END_GUARD_SECTORS;
-		if (decoy.span_hi < decoy.span_lo) decoy.span_hi = decoy.span_lo;
-		decoy.no_read = 0;
-		decoy.dev_fd = fd;
+		mir.disc_span = e.cdte_addr.lba;
+		mir.span_lo   = 0;
+		mir.span_hi   = mir.disc_span - BURST_MAX - END_GUARD_SECTORS;
+		if (mir.span_hi < mir.span_lo) mir.span_hi = mir.span_lo;
+
+		mir.media_full = (mir.disc_span > DVD_SPAN_THRESHOLD) ? MEDIA_FULL_DVD : MEDIA_FULL_CD;
+		mir.r_lo = media_radius_mm(mir.span_lo);
+		mir.r_hi = media_radius_mm(mir.span_hi);
+
+		mir.no_read = 0;
+		mir.dev_fd  = fd;
+
+		// One speed change, at open. Changing it mid-play (as the old code
+		// did, to vary loudness) is slow, often ignored over USB, and audible
+		// in a way no console drive ever was.
+		ioctl(fd, CDROM_SELECT_SPEED, MIRROR_SPEED_X);
 
 		static int last_logged_span = -1;
-		if (decoy.disc_span != last_logged_span) {
-			printf("physical_disc_acoustic: prop disc on %s, %d sectors\n", path, decoy.disc_span);
-			last_logged_span = decoy.disc_span;
+		if (mir.disc_span != last_logged_span) {
+			printf("physical_disc_acoustic: mirror disc on %s, %d sectors, "
+			       "stroke %.1f-%.1f mm\n",
+			       path, mir.disc_span, mir.r_lo, mir.r_hi);
+			last_logged_span = mir.disc_span;
 		}
 		return 0;
 	}
 	return -1;
 }
 
-static void decoy_release(void)
+static void mirror_release(void)
 {
-	if (decoy.dev_fd >= 0) { close(decoy.dev_fd); decoy.dev_fd = -1; }
-	decoy.disc_span = 0;
+	if (mir.dev_fd >= 0) { close(mir.dev_fd); mir.dev_fd = -1; }
+	mir.disc_span = 0;
 }
 
-static void *decoy_worker_main(void *arg)
+// Returns 0 on success. Handles the fault bookkeeping that decides whether to
+// fall back to seek-only or give up for the session.
+static int touch(int lba, int blocks)
+{
+	static int read_faults = 0, seek_faults = 0, reopen_faults = 0;
+
+	if (mir.dev_fd < 0) return -1;
+	if (lba < mir.span_lo) lba = mir.span_lo;
+	if (lba > mir.span_hi) lba = mir.span_hi;
+
+	int r = mir.no_read ? mirror_seek(mir.dev_fd, lba)
+	                    : mirror_read(mir.dev_fd, lba, blocks);
+
+	if (r == 0) { read_faults = seek_faults = reopen_faults = 0; return 0; }
+
+	if (r == -1) {
+		// The device went away underneath us.
+		mirror_release();
+		read_faults = seek_faults = 0;
+		if (++reopen_faults >= REOPEN_FAIL_LIMIT) {
+			printf("physical_disc_acoustic: drive keeps dropping, disabling for this session\n");
+			mir.disabled_perm = 1;
+		}
+		return -1;
+	}
+
+	if (mir.no_read) {
+		if (++seek_faults >= SEEK_FAIL_LIMIT) {
+			printf("physical_disc_acoustic: drive does not accept SEEK, disabling for this session\n");
+			mir.disabled_perm = 1;
+			mirror_release();
+		}
+	}
+	else if (++read_faults >= READ_FAIL_LIMIT) {
+		printf("physical_disc_acoustic: drive rejects READ(10), seek-only fallback\n");
+		mir.no_read = 1;
+		read_faults = 0;
+	}
+	return -1;
+}
+
+// ------------------------------------------------------- gesture player ---
+
+// A gesture carries how long the original mechanism would have taken. The USB
+// drive takes whatever it takes; we issue the ops that make it move the right
+// distance and then hold the remainder of the slot so the rhythm is right.
+static void play_gesture(const gesture_t *g)
+{
+	double start = clock_ms();
+	int target   = map_to_mirror(g->lba);
+	int from     = map_to_mirror(g->from_lba);
+	int ra       = model.drive.readahead_sectors;
+	if (ra < 1) ra = 1;
+	if (ra > BURST_MAX) ra = BURST_MAX;
+
+	switch (g->kind) {
+
+	case GEST_JUMP:
+		// Lens jump on the original: the sled never moved, so do not make the
+		// mirror's sled move either. Keep the drive loaded with a read where
+		// it already is.
+		touch(from, ra);
+		break;
+
+	case GEST_STEP:
+		touch(target, ra);
+		break;
+
+	case GEST_SLEW: {
+		// Coarse then fine. The intermediate points make the mirror's sled
+		// perform the same multi-part move the original did, which is what
+		// gives a console load its two-part "chrrk-tk" rather than one
+		// featureless swish.
+		static const double two[]   = { 0.85, 1.0 };
+		static const double three[] = { 0.60, 0.92, 1.0 };
+		const double *frac = (g->stages >= 3) ? three : two;
+		int n = (g->stages >= 3) ? 3 : 2;
+
+		double slot = g->dur_ms / n;
+		for (int i = 0; i < n; i++) {
+			if (!mir.on || mir.held || mir.dev_fd < 0) break;
+			double rf = cd_geom_radius_mm(g->from_lba);
+			double rt = cd_geom_radius_mm(g->lba);
+			int stop_lba = cd_geom_lba_at_radius(rf + (rt - rf) * frac[i]);
+			double t0 = clock_ms();
+			touch(map_to_mirror(stop_lba), ra);
+			sleep_ms(slot - (clock_ms() - t0));
+		}
+		break;
+	}
+
+	case GEST_STREAM: {
+		// Walk the mirror head outward at the rate the core is really
+		// consuming sectors, in radius-matched steps, so a 1x CDDA track
+		// creeps and a 2x data read moves twice as fast.
+		double rate = g->rate_sectors_s;
+		if (rate < 1.0) rate = 1.0;
+		int    done = 0;
+		int    want = g->sectors;
+		while (done < want && mir.on && !mir.held && mir.dev_fd >= 0) {
+			int chunk = ra;
+			if (chunk > want - done) chunk = want - done;
+			double t0 = clock_ms();
+			touch(map_to_mirror(g->lba + done), chunk);
+			done += chunk;
+			sleep_ms(chunk * 1000.0 / rate - (clock_ms() - t0));
+		}
+		break;
+	}
+
+	case GEST_HOLD:
+		// Spindle still turning, head parked on track. One small read keeps
+		// the drive focused and spun up without moving the sled.
+		touch(from, 1);
+		sleep_ms(g->dur_ms);
+		break;
+
+	case GEST_SPINUP:
+		if (mir.dev_fd >= 0) mirror_spin(mir.dev_fd, 1);
+		touch(target, ra);
+		sleep_ms(g->dur_ms - (clock_ms() - start));
+		break;
+
+	case GEST_SPINDOWN:
+		if (mir.dev_fd >= 0 && !mir.no_read) mirror_spin(mir.dev_fd, 0);
+		break;
+
+	case GEST_SWEEP: {
+		// The boot calibration pass: hub, rim, back to the hub.
+		int lo = mir.span_lo, hi = mir.span_hi;
+		double slot = g->dur_ms / 3.0;
+		int pts[3] = { lo, hi, lo };
+		for (int i = 0; i < 3; i++) {
+			if (!mir.on || mir.held || mir.dev_fd < 0) break;
+			double t0 = clock_ms();
+			touch(pts[i], ra);
+			sleep_ms(slot - (clock_ms() - t0));
+		}
+		break;
+	}
+
+	case GEST_PARK:
+		touch(mir.span_lo, ra);
+		sleep_ms(g->dur_ms - (clock_ms() - start));
+		if (mir.dev_fd >= 0 && !mir.no_read) mirror_spin(mir.dev_fd, 0);
+		break;
+
+	default:
+		break;
+	}
+}
+
+// ------------------------------------------------------------- worker -----
+
+static void *worker_main(void *arg)
 {
 	(void)arg;
-	unsigned seq_seen = 0, seq_base = 0;
-	double active_at = 0, open_attempt_at = 0, io_at = 0;
-	double rate_at = 0, rate = 0;
-	int prior_lba = -1000000;
-	int seek_faults = 0, read_faults = 0, reopen_faults = 0;
-	int spun_down = 0;
-	int applied_speed = 0;
-	double speed_changed_at = 0;
+	double open_attempt_at = 0;
+	int applied_profile = -1;
 
-	while (decoy.alive) {
-		if (!decoy.on || decoy.held || decoy.disabled_perm) {
-			decoy_release();
-			struct timespec ts = { 0, 150 * 1000 * 1000 };
-			nanosleep(&ts, NULL);
+	while (mir.alive) {
+
+		if (!mir.on || mir.held || mir.disabled_perm) {
+			mirror_release();
+			// Throw away anything the cores queued while we were parked, so
+			// we do not wake up and replay a minute of stale activity.
+			mir.ring_head = mir.ring_tail;
+			sleep_ms(150);
 			continue;
 		}
 
-		unsigned seq = decoy.touch_count;
-		double now = clock_ms();
-		if (seq != seq_seen) { seq_seen = seq; active_at = now; spun_down = 0; }
-
-		if (now - active_at >= ACTIVITY_WINDOW_MS) {
-			if (!spun_down && decoy.dev_fd >= 0 && !decoy.no_read
-			    && now - active_at >= SPINDOWN_IDLE_MS) {
-				decoy_spin(decoy.dev_fd, 0);
-				spun_down = 1;
-				applied_speed = 0;
-			}
-			struct timespec ts = { 0, 80 * 1000 * 1000 };
-			nanosleep(&ts, NULL);
-			continue;
+		if (mir.profile_req != applied_profile) {
+			applied_profile = mir.profile_req;
+			acu_model_init(&model, (pd_acoustic_profile_t)applied_profile);
+			printf("physical_disc_acoustic: imitating the %s drive\n", model.drive.name);
 		}
 
 		if (physical_disc_drive_busy()) {
-			decoy_release();
-			struct timespec ts = { 0, 200 * 1000 * 1000 };
-			nanosleep(&ts, NULL);
+			// The real disc is being read for data; that drive noise is
+			// genuine and we must not fight it for the device.
+			mirror_release();
+			mir.ring_head = mir.ring_tail;
+			sleep_ms(200);
 			continue;
 		}
 
-		if (decoy.dev_fd < 0) {
-			if (now - open_attempt_at < 1000) {
-				struct timespec ts = { 0, 100 * 1000 * 1000 };
-				nanosleep(&ts, NULL);
-				continue;
-			}
+		double now = clock_ms();
+
+		// Drain whatever the cores reported into the model.
+		int drained = 0;
+		while (mir.ring_head != mir.ring_tail && drained < 64) {
+			acu_event_t e = mir.ring[mir.ring_head & (EVENT_RING - 1)];
+			mir.ring_head++;
+			acu_model_event(&model, e.at_ms, e.ev, e.lba, e.count);
+			drained++;
+		}
+		acu_model_tick(&model, now);
+
+		gesture_t g;
+		if (!acu_model_poll(&model, &g)) {
+			sleep_ms(10);
+			continue;
+		}
+
+		// Nothing to open the drive for unless there is real work.
+		if (g.kind == GEST_NONE) continue;
+
+		if (mir.dev_fd < 0) {
+			if (now - open_attempt_at < 1000.0) { sleep_ms(100); continue; }
 			open_attempt_at = now;
-			if (decoy_acquire()) {
-				struct timespec ts = { 0, 100 * 1000 * 1000 };
-				nanosleep(&ts, NULL);
-				continue;
-			}
-			prior_lba = -1000000;
-			applied_speed = 0;
+			if (mirror_acquire()) { sleep_ms(100); continue; }
 		}
 
-		if (now - rate_at >= RATE_SAMPLE_MS) {
-			unsigned d = seq - seq_base;
-			double dt = now - rate_at;
-			double inst = dt > 0 ? d * 1000.0 / dt : 0;
-			rate += (inst - rate) * 0.3;
-			seq_base = seq;
-			rate_at = now;
-		}
-		int burst = 2 + (int)((rate - 8) / 6);
-		if (burst < BURST_MIN) burst = BURST_MIN;
-		if (burst > BURST_MAX) burst = BURST_MAX;
-		double gap = 120.0 - rate;
-		if (gap < 10.0) gap = 10.0;
-		if (gap > 120.0) gap = 120.0;
-
-		if (!decoy.no_read) {
-			double target = DRIVE_SPEED_MIN + rate / 12.0;
-			if (target > DRIVE_SPEED_MAX) target = DRIVE_SPEED_MAX;
-			int want = applied_speed;
-			if (applied_speed < DRIVE_SPEED_MIN) want = DRIVE_SPEED_MIN;
-			else if (target >= applied_speed + DRIVE_SPEED_STEP) want = applied_speed + DRIVE_SPEED_STEP;
-			else if (target <= applied_speed - DRIVE_SPEED_STEP) want = applied_speed - DRIVE_SPEED_STEP;
-			if (want > DRIVE_SPEED_MAX) want = DRIVE_SPEED_MAX;
-			if (want < DRIVE_SPEED_MIN) want = DRIVE_SPEED_MIN;
-			if (want != applied_speed && now - speed_changed_at >= SPEED_CHANGE_DEBOUNCE_MS) {
-				decoy_set_speed(decoy.dev_fd, want);
-				applied_speed = want;
-				speed_changed_at = now;
-			}
-		}
-
-		int lba = project_lba(decoy.game_pos);
-		int jump = lba > prior_lba ? lba - prior_lba : prior_lba - lba;
-
-		if (!decoy.no_read) {
-			if (jump >= REPOSITION_JUMP || now - io_at >= gap) {
-				int r = decoy_read(decoy.dev_fd, lba, burst);
-				if (r == 0) {
-					read_faults = 0; seek_faults = 0; reopen_faults = 0;
-					io_at = now; prior_lba = lba;
-				} else if (r == -1) {
-					decoy_release(); read_faults = 0;
-					if (++reopen_faults >= REOPEN_FAIL_LIMIT) {
-						printf("physical_disc_acoustic: drive keeps dropping, disabling for this session\n");
-						decoy.disabled_perm = 1;
-					}
-				} else {
-					if (++read_faults >= READ_FAIL_LIMIT) {
-						printf("physical_disc_acoustic: drive rejects READ(10), seek-only fallback\n");
-						decoy.no_read = 1;
-					} else {
-						decoy_seek(decoy.dev_fd, lba);
-					}
-					io_at = now; prior_lba = lba;
-				}
-			}
-		} else if (!decoy.disabled_perm) {
-			if (jump >= REPOSITION_JUMP || now - io_at >= IDLE_SEEK_PERIOD_MS) {
-				int r = decoy_seek(decoy.dev_fd, lba);
-				if (r == -1) {
-					decoy_release(); seek_faults = 0;
-					if (++reopen_faults >= REOPEN_FAIL_LIMIT) {
-						printf("physical_disc_acoustic: drive keeps dropping, disabling for this session\n");
-						decoy.disabled_perm = 1;
-					}
-				} else if (r < 0) {
-					if (++seek_faults >= SEEK_FAIL_LIMIT) {
-						printf("physical_disc_acoustic: drive does not accept SEEK, disabling for this session\n");
-						decoy.disabled_perm = 1;
-						decoy_release();
-					}
-				} else {
-					seek_faults = 0; reopen_faults = 0;
-					io_at = now; prior_lba = lba;
-				}
-			}
-		}
-
-		struct timespec ts = { 0, 20 * 1000 * 1000 };
-		nanosleep(&ts, NULL);
+		play_gesture(&g);
 	}
 
-	decoy_release();
+	mirror_release();
 	return NULL;
 }
 
+// --------------------------------------------------------------- API ------
+
 void physical_disc_acoustic_config(int enabled)
 {
-	decoy.on = enabled ? 1 : 0;
-	if (decoy.on && !decoy.alive) {
-		decoy.alive = 1;
-		decoy.held = 0;
-		if (pthread_create(&decoy.worker, NULL, decoy_worker_main, NULL)) {
-			decoy.alive = 0;
+	mir.on = enabled ? 1 : 0;
+	if (mir.on && !mir.alive) {
+		mir.dev_fd      = -1;
+		mir.held        = 0;
+		mir.profile_req = PD_ACU_PROFILE_AUTO;
+		mir.media_full  = MEDIA_FULL_CD;
+		acu_model_init(&model, PD_ACU_PROFILE_AUTO);
+		mir.alive = 1;
+		if (pthread_create(&mir.worker, NULL, worker_main, NULL)) {
+			mir.alive = 0;
 			printf("physical_disc_acoustic: could not start thread\n");
 			return;
 		}
-		printf("physical_disc_acoustic: enabled - put a spare data disc in the drive\n");
+		printf("physical_disc_acoustic: enabled - put a spare disc in the drive\n");
 	}
+}
+
+void physical_disc_acoustic_set_profile(pd_acoustic_profile_t profile)
+{
+	// PHYSICAL_DISC_ACOUSTIC_PROFILE in MiSTer.ini pins the imitated drive;
+	// left at 0 it follows whichever core has just mounted a disc.
+	int forced = cfg.physical_disc_acoustic_profile;
+	if (forced > PD_ACU_PROFILE_AUTO && forced < PD_ACU_PROFILE_COUNT) {
+		mir.profile_req = forced;
+		return;
+	}
+
+	if (profile <= PD_ACU_PROFILE_AUTO || profile >= PD_ACU_PROFILE_COUNT) return;
+	mir.profile_req = (int)profile;
+}
+
+void physical_disc_acoustic_event(pd_acoustic_event_t ev, int lba, int count)
+{
+	if (!mir.on || mir.held || mir.disabled_perm) return;
+
+	unsigned tail = mir.ring_tail;
+	if (tail - mir.ring_head >= EVENT_RING - 1) {
+		// The worker is behind. Dropping is correct: the model only needs to
+		// know where the head ended up, and the newest event says that.
+		mir.dropped++;
+		return;
+	}
+
+	acu_event_t *e = &mir.ring[tail & (EVENT_RING - 1)];
+	e->ev    = ev;
+	e->lba   = lba;
+	e->count = count;
+	e->at_ms = clock_ms();
+
+	// Publish only once the slot is fully written.
+	__sync_synchronize();
+	mir.ring_tail = tail + 1;
 }
 
 void physical_disc_acoustic_hint(int lba)
 {
-	if (!decoy.on || decoy.held) return;
-	decoy.game_pos = lba;
-	decoy.touch_count++;
+	physical_disc_acoustic_event(PD_ACU_READ, lba, 1);
 }
 
 void physical_disc_acoustic_pause(void)
 {
-	decoy.held = 1;
+	mir.held = 1;
 }
 
 void physical_disc_acoustic_resume(void)
 {
-	decoy.held = 0;
+	mir.held = 0;
 }

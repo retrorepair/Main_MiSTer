@@ -165,7 +165,12 @@ chd_error mister_chd_read_sector(chd_file *chd_f, int lba, uint32_t d_offset, ui
 {
 
 
-	physical_disc_acoustic_hint(lba);
+	// No acoustic hint here any more. Every core that reads CHD sectors now
+	// reports its own drive activity (data vs audio, burst size, seeks, tray
+	// and spindle state) through physical_disc_acoustic_event(), which is both
+	// richer and correctly placed. Hinting again from the storage layer would
+	// double-count each sector and, because the second hint arrives one sector
+	// BEHIND the modelled head, fabricate a seek that never happened.
 
 	int tmphnum = 0;
 	int hunkofs = 0;

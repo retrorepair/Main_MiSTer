@@ -8,6 +8,7 @@
 #include "megacd.h"
 #include "../chd/mister_chd.h"
 #include "../physical_disc/physical_disc.h"
+#include "../physical_disc/physical_disc_acoustic.h"
 
 cdd_t cdd;
 
@@ -246,6 +247,8 @@ int cdd_t::Load(const char *filename)
 
 	Unload();
 
+	physical_disc_acoustic_set_profile(PD_ACU_PROFILE_MEGACD);
+
 	const char *ext = filename+strlen(filename)-4;
 	if (!strcmp(filename, PHYSICAL_DISC_SENTINEL))
 	{
@@ -478,6 +481,14 @@ void cdd_t::Update() {
 			SectorSend(0);
 		}
 
+		// One sector delivered. Data tracks run the mechanism differently from
+		// Red Book audio, so tell the mirror which it was: the Mega CD reads
+		// both at 1x but a game streaming CDDA sounds nothing like one
+		// hammering its data track.
+		physical_disc_acoustic_event(
+			this->toc.tracks[this->index].type ? PD_ACU_READ : PD_ACU_PLAY,
+			this->lba, 1);
+
 		this->lba++;
 		this->chd_audio_read_lba++;
 
@@ -529,6 +540,10 @@ void cdd_t::Update() {
 		this->chd_audio_read_lba = this->lba;
 
 		this->isData = this->toc.tracks[this->index].type;
+
+		// Fast forward / rewind: the servo hops a block at a time, a rapid
+		// regular ticking quite unlike a seek or a read.
+		physical_disc_acoustic_event(PD_ACU_SCAN, this->lba, 0);
 
 		if (this->toc.sub.opened()) FileSeek(&this->toc.sub, this->lba * 96, SEEK_SET);
 
@@ -601,6 +616,9 @@ void cdd_t::CommandExec() {
 	case CD_COMM_STOP:
 		this->status = CD_STAT_STOP;
 		this->isData = 1;
+
+		// Spindle off. On a real Mega CD you hear it wind down.
+		physical_disc_acoustic_event(PD_ACU_STOP, this->lba, 0);
 
 		stat[0] = this->status;
 		stat[1] = 0;
@@ -797,12 +815,16 @@ void cdd_t::CommandExec() {
 
 		this->status = CD_STAT_PAUSE;
 
+		// Held on track: the spindle keeps turning but the sled stops.
+		physical_disc_acoustic_event(PD_ACU_PAUSE, this->lba, 0);
+
 		stat[0] = this->status;
 		//printf("\x1b[32mMCD: Command PAUSE, status = %X, frame = %u\n\x1b[0m", this->status, frame);
 		break;
 
 	case CD_COMM_RESUME:
 		this->status = CD_STAT_PLAY;
+		physical_disc_acoustic_event(PD_ACU_SPINUP, this->lba, 0);
 		stat[0] = this->status;
 		this->audioOffset = 0;
 		//printf("\x1b[32mMCD: Command RESUME, status = %X\n\x1b[0m", this->status);
@@ -823,6 +845,7 @@ void cdd_t::CommandExec() {
 	case CD_COMM_TRACK_MOVE:
 		this->isData = 1;
 		this->status = CD_STAT_PAUSE;
+		physical_disc_acoustic_event(PD_ACU_PAUSE, this->lba, 0);
 		stat[0] = this->status;
 		break;
 
@@ -857,6 +880,13 @@ void cdd_t::CommandExec() {
 	case CD_COMM_TRAY_CLOSE:
 		this->isData = 1;
 		this->status = this->loaded ? CD_STAT_TOC : CD_STAT_NO_DISC;
+
+		// Lid shut on a disc: spin up, servo calibration sweep, then the drive
+		// goes back to the lead-in to read the TOC. That whole sequence is the
+		// sound people recognise as a Mega CD starting up.
+		physical_disc_acoustic_event(PD_ACU_TRAY_CLOSE, 0, 0);
+		if (this->loaded) physical_disc_acoustic_event(PD_ACU_TOC, 0, 0);
+
 		stat[0] = CD_STAT_STOP;
 
 		//printf("\x1b[32mMCD: Command TRAY_CLOSE, status = %u, frame = %u\n\x1b[0m", this->status, frame);
@@ -865,6 +895,10 @@ void cdd_t::CommandExec() {
 	case CD_COMM_TRAY_OPEN:
 		this->isData = 1;
 		this->status = CD_STAT_OPEN;
+
+		// Sled parks at the hub and the spindle stops before the lid releases.
+		physical_disc_acoustic_event(PD_ACU_TRAY_OPEN, 0, 0);
+
 		stat[0] = CD_STAT_OPEN;
 
 		//printf("\x1b[32mMCD: Command TRAY_OPEN, status = %u, frame = %u\n\x1b[0m", this->status, frame);
@@ -935,6 +969,10 @@ void cdd_t::SeekToLBA(int lba, int play) {
 	}
 
 	this->latency += (abs(lba - this->lba) * 120) / 270000;
+
+	// The drive is repositioning: this is the single loudest thing it does and
+	// it happens whether we are playing from a real disc or from an image.
+	physical_disc_acoustic_event(PD_ACU_SEEK, lba, 0);
 
 	this->lba = lba;
 

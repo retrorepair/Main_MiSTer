@@ -22,6 +22,7 @@
 #include <arpa/inet.h>
 #include "cdg_unpacker.hpp"
 #include "../physical_disc/physical_disc.h"
+#include "../physical_disc/physical_disc_acoustic.h"
 
 #define TIMEKEEPER_SIZE (8 * 1024)
 
@@ -934,6 +935,10 @@ void subcode_q_data(int lba, struct subcode& out)
 
 void cdi_read_cd(uint8_t* buffer, int lba, int cnt)
 {
+	// The CD-i deck reads at 1x. `cnt` is the whole burst the core asked for,
+	// so the mirror can tell a long sequential read from a one-sector poke.
+	physical_disc_acoustic_event(PD_ACU_READ, lba - 150, cnt);
+
 	int calc_lba = lba;
 	uint8_t am;
 	am = calc_lba / (60 * 75);

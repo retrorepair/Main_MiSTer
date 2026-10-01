@@ -7,6 +7,7 @@
 #include "3do.h"
 #include "../chd/mister_chd.h"
 #include "../physical_disc/physical_disc.h"
+#include "../physical_disc/physical_disc_acoustic.h"
 
 p3docdd_t p3docdd;
 
@@ -315,6 +316,7 @@ int p3docdd_t::LoadISO(const char* filename) {
 
 int p3docdd_t::Load(const char *filename)
 {
+	physical_disc_acoustic_set_profile(PD_ACU_PROFILE_3DO);
 	Unload();
 
 	const char *ext = filename + strlen(filename) - 4;
@@ -515,6 +517,8 @@ void p3docdd_t::CommandExec() {
 	case P3DO_COMM_READ:
 		this->lba = cmd_lba - 150;
 
+		physical_disc_acoustic_event(PD_ACU_SEEK, this->lba, 0);
+
 
 		if (this->toc.phys) physical_disc_seek_hint(this->lba);
 
@@ -649,6 +653,7 @@ void p3docdd_t::Update() {
 
 	case P3DO_Pause:
 	case P3DO_Stop:
+		physical_disc_acoustic_event(PD_ACU_PAUSE, this->lba, 0);
 		this->track = this->toc.GetTrackByLBA(this->lba);
 		break;
 	}
@@ -702,6 +707,8 @@ void p3docdd_t::ReadData(uint8_t *buf)
 	if (this->toc.tracks[this->track].type == TT_MODE1)
 	{
 		int lba_ = this->lba >= 0 ? this->lba : 0;
+
+		physical_disc_acoustic_event(PD_ACU_READ, lba_, 1);
 		if (this->toc.phys)
 		{
 

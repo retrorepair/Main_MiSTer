@@ -12,6 +12,7 @@
 #include "../../cheats.h"
 #include "../megacd/megacd.h"
 #include "../physical_disc/physical_disc.h"
+#include "../physical_disc/physical_disc_acoustic.h"
 #include "neogeocd.h"
 #include "neogeo_loader.h"
 
@@ -148,6 +149,10 @@ int neocd_set_image(const char *filename)
 
 		if (cdd.Load(filename) > 0)
 		{
+			// cdd_t is shared with the Mega CD, so Load() has just selected
+			// that profile. The Neo Geo CD is a slower 1x top loader.
+			physical_disc_acoustic_set_profile(PD_ACU_PROFILE_NEOGEO);
+
 			toc_t disc_toc = {};
 			int audio_only = phys && !physical_disc_current_toc(&disc_toc) && physical_disc_toc_audio_only(&disc_toc);
 			cdd.isData = audio_only ? 0 : 1;
