@@ -77,6 +77,7 @@ static const ini_var_t ini_vars[] =
 	{ "PHYSICAL_DISC_MOUNT_DELAY", (void*)(&(cfg.physical_disc_mount_delay)), UINT8, 0, 30 },
 	{ "PHYSICAL_DISC_ACOUSTIC", (void*)(&(cfg.physical_disc_acoustic)), UINT8, 0, 2 },
 	{ "PHYSICAL_DISC_ACOUSTIC_PROFILE", (void*)(&(cfg.physical_disc_acoustic_profile)), UINT8, 0, 7 },
+	{ "PHYSICAL_DISC_ACOUSTIC_GAIN", (void*)(&(cfg.physical_disc_acoustic_gain)), UINT8, 1, 20 },
 	{ "AUDIOCD", (void*)(cfg.physical_disc_audio_cd), STRING, 0, sizeof(cfg.physical_disc_audio_cd) - 1 },
 	{ "DVD", (void*)(cfg.physical_disc_dvd), STRING, 0, sizeof(cfg.physical_disc_dvd) - 1 },
 	{ "FONT", (void*)(&(cfg.font)), STRING, 0, sizeof(cfg.font) - 1 },
@@ -621,6 +622,7 @@ void cfg_parse()
 	cfg.physical_disc_mount_delay = 2;	
 	cfg.physical_disc_acoustic = 0;	
 	cfg.physical_disc_acoustic_profile = 0;	// 0 = follow whichever core is running
+	cfg.physical_disc_acoustic_gain = 1;	// 1 = physically faithful sled travel
 	strcpy(cfg.physical_disc_audio_cd, "PSX");
 	cfg.video_brightness = 50;
 	cfg.video_contrast = 50;

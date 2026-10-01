@@ -89,6 +89,37 @@ round-trips the LBA/radius conversion. `sim_timeline` runs a PSX boot-and-load
 trace through the model and prints the gesture timeline, the radial mapping,
 and the modelled seek times for every profile.
 
+## The mirror disc matters more than anything else
+
+Measured on hardware while playing Sonic CD: **684 of 694 gestures moved the
+sled less than 0.05 mm.** That is faithful — a real Mega CD streaming CDDA
+barely moves its sled either — but a 1991 deck at 1x is audibly working the
+whole time, and a 2026 slot-load drive doing the same tiny moves is silent.
+
+Two things follow.
+
+**Use a disc that is genuinely full of readable data.** The engine can only
+move the head across the recorded area. A lead-out address is not a promise: a
+Mortal Kombat 3 PC CD whose TOC claimed 164214 sectors turned out to be
+readable only to LBA 14064, leaving **2.3 mm of travel out of a possible 34**.
+A full 700 MB CD-R gives roughly fifteen times the stroke. The usable extent is
+discovered during play (reads that fail pull the span in) and logged, so check
+the trace if it sounds cramped.
+
+**`PHYSICAL_DISC_ACOUSTIC_GAIN`** multiplies each move while keeping its
+direction, so a file-system hop that would be 17 µm becomes something you can
+hear. Absolute radius is then no longer preserved, which costs some CLV spindle
+pitch accuracy — that is the trade, and it is why the default is `1`
+(unchanged, faithful). `8` was measured to give very close to 8x the travel.
+Spin-up, the servo sweep and tray park re-anchor to the true position.
+
+Reads use `READ(10)` with **Force Unit Access** so they come off the media
+rather than out of the drive's cache. Without FUA the small repeated reads a
+stream gesture issues are nearly all cache hits and the mechanism never moves
+at all. `READ CD` (0xBE, raw 2352) is the fallback for an audio or mixed-mode
+disc, where `READ(10)` cannot touch a CD-DA sector; seek-only is the last
+resort.
+
 ## Tuning
 
 The per-console numbers are all in one table at the top of

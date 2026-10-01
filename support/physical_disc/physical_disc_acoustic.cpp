@@ -167,7 +167,7 @@ static int mirror_seek(int fd, int lba)
 // big loss, because a drive that is reading sounds quite different from one
 // that is merely stepping. READ CD reads both kinds, so the whole disc stays
 // usable as mirror surface and the full radial stroke stays available.
-static int mirror_read_raw(int fd, int lba, int blocks)
+static int mirror_read_raw(int fd, int lba, int blocks, int timeout_ms)
 {
 	uint8_t cdb[12] = { 0 };
 	uint8_t sense[32];
@@ -196,14 +196,14 @@ static int mirror_read_raw(int fd, int lba, int blocks)
 	io.dxferp          = burst_buf;
 	io.sbp             = sense;
 	io.mx_sb_len       = sizeof(sense);
-	io.timeout         = CMD_TIMEOUT_MS;
+	io.timeout         = timeout_ms;
 
 	if (ioctl(fd, SG_IO, &io) < 0) return -1;
 	if (io.status || io.host_status || io.driver_status) return -2;
 	return 0;
 }
 
-static int mirror_read(int fd, int lba, int blocks)
+static int mirror_read(int fd, int lba, int blocks, int timeout_ms)
 {
 	uint8_t cdb[10] = { 0 };
 	uint8_t sense[32];
@@ -213,6 +213,12 @@ static int mirror_read(int fd, int lba, int blocks)
 	if (blocks > BURST_MAX) blocks = BURST_MAX;
 
 	cdb[0] = 0x28;                      // READ(10)
+	// Force Unit Access: come off the media, not out of the drive's RAM cache.
+	// Without this the mirror is near-silent. A modern drive has megabytes of
+	// cache and reads ahead aggressively, so the small repeated reads a stream
+	// gesture issues are nearly all cache hits and the mechanism never moves.
+	// We are here for the mechanism, not the data.
+	cdb[1] = 0x08;
 	cdb[2] = (lba >> 24) & 0xFF;
 	cdb[3] = (lba >> 16) & 0xFF;
 	cdb[4] = (lba >> 8) & 0xFF;
@@ -229,7 +235,7 @@ static int mirror_read(int fd, int lba, int blocks)
 	io.dxferp          = burst_buf;
 	io.sbp             = sense;
 	io.mx_sb_len       = sizeof(sense);
-	io.timeout         = CMD_TIMEOUT_MS;
+	io.timeout         = timeout_ms;
 
 	if (ioctl(fd, SG_IO, &io) < 0) return -1;
 	if (io.status || io.host_status || io.driver_status) return -2;
@@ -330,8 +336,34 @@ static int mirror_acquire(void)
 		mir.r_hi = media_radius_mm(mir.span_hi);
 
 		mir.no_read  = 0;
-		mir.raw_read = 1;   // try READ CD first; touch() downgrades if refused
 		mir.dev_fd   = fd;
+
+		// Pick the read command once, here, by trying them. READ(10)+FUA is
+		// preferred because FUA is what forces real media access; READ CD is
+		// the fallback that also works on an audio or mixed-mode disc, where
+		// READ(10) cannot touch a CD-DA sector at all.
+		mir.raw_read = 0;
+		if (mirror_read(fd, mir.span_lo, 2, CMD_TIMEOUT_MS)) {
+			mir.raw_read = 1;
+			if (mirror_read_raw(fd, mir.span_lo, 2, CMD_TIMEOUT_MS)) {
+				mir.raw_read = 0;
+				mir.no_read  = 1;
+				acu_log("neither READ(10) nor READ CD works: seek-only\n");
+			}
+		}
+		acu_log("read mode: %s\n", mir.no_read ? "seek-only"
+		                        : mir.raw_read ? "READ CD raw 2352"
+		                                       : "READ(10)+FUA");
+
+		// How far the disc is really readable is discovered during play, by
+		// pulling the span in when a read fails (see touch()). Probing it up
+		// front with a binary search was tried and measured at 18 seconds on a
+		// part-written disc: an unreadable sector costs ~1.5 s because the
+		// drive retries internally, and a short SG_IO timeout does not stop
+		// it. A stall that long at every disc mount is far worse than
+		// converging over the first few seconds of play.
+		acu_log("stroke %.1f-%.1f mm from TOC; will pull in if reads fail\n",
+		        mir.r_lo, mir.r_hi);
 
 		// Lock the drive to the speed the console's own mechanism ran at. A
 		// Mega CD is 1x; letting a modern drive sit at 4x or faster gives a
@@ -340,6 +372,9 @@ static int mirror_acquire(void)
 		// One change, at open: doing it mid-play is slow and often ignored.
 		int want_x = (int)(model.drive.data_speed + 0.5);
 		if (want_x < 1) want_x = 1;
+		// We hold this device open for long stretches; the sr driver locks the
+		// tray on open where the drive supports it. Leave the tray the user's.
+		ioctl(fd, CDROM_LOCKDOOR, 0);
 		ioctl(fd, CDROM_SELECT_SPEED, want_x);
 
 		acu_log("acquired %s: %d sectors, stroke %.1f-%.1f mm, %s media, "
@@ -390,8 +425,8 @@ static int touch(int lba, int blocks)
 	// seek-only if it will not read at all.
 	int r;
 	if (mir.no_read)        r = mirror_seek(mir.dev_fd, lba);
-	else if (mir.raw_read)  r = mirror_read_raw(mir.dev_fd, lba, blocks);
-	else                    r = mirror_read(mir.dev_fd, lba, blocks);
+	else if (mir.raw_read)  r = mirror_read_raw(mir.dev_fd, lba, blocks, CMD_TIMEOUT_MS);
+	else                    r = mirror_read(mir.dev_fd, lba, blocks, CMD_TIMEOUT_MS);
 
 	if (r == 0) { read_faults = seek_faults = reopen_faults = 0; return 0; }
 
@@ -404,6 +439,23 @@ static int touch(int lba, int blocks)
 			mir.disabled_perm = 1;
 		}
 		return -1;
+	}
+
+	// A read that fails out towards the rim usually means the disc simply is
+	// not recorded that far, or its outer edge is unreadable -- not that the
+	// drive cannot read. Pull the usable span in and carry on reading, rather
+	// than condemning the whole session to seek-only and going quiet.
+	if (!mir.no_read && r == -2 && lba > mir.span_lo + (mir.span_hi - mir.span_lo) / 8) {
+		static int shrinks = 0;
+		if (++shrinks <= 10) {
+			int keep = lba - (BURST_MAX + END_GUARD_SECTORS);
+			if (keep < mir.span_lo) keep = mir.span_lo;
+			mir.span_hi = keep;
+			mir.r_hi    = media_radius_mm(mir.span_hi);
+			acu_log("read failed at %d, shrinking usable span to %d (rim now %.1f mm)\n",
+			        lba, mir.span_hi, mir.r_hi);
+			return -1;
+		}
 	}
 
 	if (mir.no_read) {
@@ -446,16 +498,76 @@ static int own_device(void)
 // A gesture carries how long the original mechanism would have taken. The USB
 // drive takes whatever it takes; we issue the ops that make it move the right
 // distance and then hold the remainder of the slot so the rhythm is right.
+// Amplified head position, 0..1 of the mirror's stroke.
+//
+// Measured on real hardware: playing Sonic CD, 684 of 694 gestures moved the
+// sled less than 0.05 mm. That is FAITHFUL -- a real Mega CD streaming CDDA
+// also barely moves its sled -- but a 1991 deck at 1x is audibly working the
+// whole time, while a 2026 slot-load drive doing the same tiny moves is
+// silent. Radial fidelity is a means, not the end.
+//
+// GAIN multiplies each move while keeping its direction, so a file-system hop
+// that would be 17 um becomes something you can hear. Absolute radius is then
+// no longer preserved, which costs some of the CLV spindle pitch accuracy --
+// that is the trade, and it is why the default is 1 (unchanged, faithful).
+static double mir_u      = -1.0;   // current amplified position
+static double mir_last_u = -1.0;   // last faithful position we saw
+
+static double stroke_fraction(int game_lba)
+{
+	double r = cd_geom_radius_mm(game_lba);
+	double u = (r - CD_R_INNER_MM) / (CD_R_OUTER_MM - CD_R_INNER_MM);
+	if (u < 0.0) u = 0.0;
+	if (u > 1.0) u = 1.0;
+	return u;
+}
+
+static int amplified_mirror_lba(int game_lba, int resync)
+{
+	double gain = cfg.physical_disc_acoustic_gain;
+	if (gain < 1.0) gain = 1.0;
+
+	double u = stroke_fraction(game_lba);
+
+	if (resync || mir_u < 0.0 || mir_last_u < 0.0) {
+		mir_u = u;             // spin-up, sweep and park re-anchor to the truth
+	}
+	else {
+		mir_u += (u - mir_last_u) * gain;
+		if (mir_u < 0.0) mir_u = 0.0;
+		if (mir_u > 1.0) mir_u = 1.0;
+	}
+	mir_last_u = u;
+
+	int lba = media_lba_at_radius(mir.r_lo + mir_u * (mir.r_hi - mir.r_lo));
+	if (lba < mir.span_lo) lba = mir.span_lo;
+	if (lba > mir.span_hi) lba = mir.span_hi;
+	return lba;
+}
+
+static int mir_prev_lba = -1;    // last place we actually sent the head
+
 static void play_gesture(const gesture_t *g)
 {
 	double start = clock_ms();
-	int target   = map_to_mirror(g->lba);
-	int from     = map_to_mirror(g->from_lba);
+	int resync   = (g->kind == GEST_SPINUP || g->kind == GEST_SWEEP ||
+	                g->kind == GEST_PARK);
+	int target   = amplified_mirror_lba(g->lba, resync);
 
+	// `from` must be where the head actually IS, which once a gain is applied
+	// is not the faithful mapping of the game's previous LBA.
+	int from = (mir_prev_lba >= 0 && !resync) ? mir_prev_lba : target;
+	mir_prev_lba = target;
+
+	// Report BOTH travels: what the original mechanism would have done, and
+	// what this drive is actually being asked to do. The second is the one
+	// you can hear, and the ratio is the gain doing its job.
+	double mirror_mm = media_radius_mm(target) - media_radius_mm(from);
+	if (mirror_mm < 0) mirror_mm = -mirror_mm;
 	acu_log("%-8s game %7d->%-7d  mirror %7d->%-7d  %8.1f turns "
-	        "%6.3fmm %5.0frpm %5.0fms x%d%s\n",
+	        "real %6.3fmm mirror %6.3fmm %5.0frpm %5.0fms x%d%s\n",
 	        acu_gesture_name(g->kind), g->from_lba, g->lba, from, target,
-	        g->turns, g->radial_mm, g->rpm, g->dur_ms, g->stages,
+	        g->turns, g->radial_mm, mirror_mm, g->rpm, g->dur_ms, g->stages,
 	        mir.no_read ? " [SEEK-ONLY]" : "");
 	int ra       = model.drive.readahead_sectors;
 	if (ra < 1) ra = 1;
@@ -484,14 +596,17 @@ static void play_gesture(const gesture_t *g)
 		const double *frac = (g->stages >= 3) ? three : two;
 		int n = (g->stages >= 3) ? 3 : 2;
 
+		// Interpolate in MIRROR radius, between where the head is and where it
+		// is going. Staging in game space would silently discard the gain and
+		// collapse every stage onto almost the same place.
 		double slot = g->dur_ms / n;
+		double rf   = media_radius_mm(from);
+		double rt   = media_radius_mm(target);
 		for (int i = 0; i < n; i++) {
 			if (!mir.on || mir.held || mir.phys_session || mir.dev_fd < 0) break;
-			double rf = cd_geom_radius_mm(g->from_lba);
-			double rt = cd_geom_radius_mm(g->lba);
-			int stop_lba = cd_geom_lba_at_radius(rf + (rt - rf) * frac[i]);
+			int stop_lba = media_lba_at_radius(rf + (rt - rf) * frac[i]);
 			double t0 = clock_ms();
-			touch(map_to_mirror(stop_lba), ra);
+			touch(stop_lba, ra);
 			sleep_ms(slot - (clock_ms() - t0));
 		}
 		break;
