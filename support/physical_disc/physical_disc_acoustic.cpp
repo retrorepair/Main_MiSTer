@@ -86,6 +86,7 @@ typedef struct {
 	volatile int alive;
 	volatile int disabled_perm;
 	volatile int no_read;
+	volatile int play_mode;   // drive runs the mechanism via PLAY AUDIO at true 1x
 	volatile int shrinks;     // reactive span pull-ins, reset on each acquire
 	volatile int raw_read;   // drive accepts READ CD (0xBE), so audio works too
 	volatile int profile_req;
@@ -243,6 +244,127 @@ static int mirror_read(int fd, int lba, int blocks, int timeout_ms)
 	return 0;
 }
 
+// ---- PLAY AUDIO: the only way to make a modern drive run at a console speed.
+//
+// Measured on the drive in this machine: SET CD SPEED is accepted and ignored,
+// and a data read runs at 12-19x however it is asked. Audio playback has to be
+// real time, so the drive has no choice -- measured 75.1 sectors/s, 1.002x,
+// which is exactly what a Mega CD does. The spindle then also glides with
+// radius the way CLV requires, the head advances itself with no commands at
+// all, and nothing can be served from cache because it is decoding as it goes.
+//
+// Re-issuing PLAY at a new address is a real sled seek (288 ms measured for a
+// 120000-sector jump), so one mechanism covers both streaming and seeking.
+static int mirror_play(int fd, int lba, int blocks)
+{
+	uint8_t cdb[10] = { 0 };
+	uint8_t sense[32];
+	struct sg_io_hdr io;
+
+	if (blocks < 1) blocks = 1;
+	if (blocks > 0xFFFF) blocks = 0xFFFF;
+
+	cdb[0] = 0x45;                      // PLAY AUDIO(10)
+	cdb[2] = (lba >> 24) & 0xFF;
+	cdb[3] = (lba >> 16) & 0xFF;
+	cdb[4] = (lba >> 8) & 0xFF;
+	cdb[5] = lba & 0xFF;
+	cdb[7] = (blocks >> 8) & 0xFF;
+	cdb[8] = blocks & 0xFF;
+
+	memset(&io, 0, sizeof(io));
+	io.interface_id    = 'S';
+	io.cmd_len         = 10;
+	io.cmdp            = cdb;
+	io.dxfer_direction = SG_DXFER_NONE;
+	io.sbp             = sense;
+	io.mx_sb_len       = sizeof(sense);
+	io.timeout         = CMD_TIMEOUT_MS;
+
+	if (ioctl(fd, SG_IO, &io) < 0) return -1;
+	if (io.status || io.host_status || io.driver_status) return -2;
+	return 0;
+}
+
+static int mirror_pause(int fd, int resume)
+{
+	uint8_t cdb[10] = { 0 };
+	uint8_t sense[32];
+	struct sg_io_hdr io;
+
+	cdb[0] = 0x4B;                      // PAUSE/RESUME
+	cdb[8] = resume ? 0x01 : 0x00;
+
+	memset(&io, 0, sizeof(io));
+	io.interface_id    = 'S';
+	io.cmd_len         = 10;
+	io.cmdp            = cdb;
+	io.dxfer_direction = SG_DXFER_NONE;
+	io.sbp             = sense;
+	io.mx_sb_len       = sizeof(sense);
+	io.timeout         = CMD_TIMEOUT_MS;
+
+	if (ioctl(fd, SG_IO, &io) < 0) return -1;
+	if (io.status || io.host_status || io.driver_status) return -2;
+	return 0;
+}
+
+static int mirror_stop_play(int fd)
+{
+	uint8_t cdb[6] = { 0 };
+	uint8_t sense[32];
+	struct sg_io_hdr io;
+
+	cdb[0] = 0x4E;                      // STOP PLAY/SCAN
+
+	memset(&io, 0, sizeof(io));
+	io.interface_id    = 'S';
+	io.cmd_len         = 6;
+	io.cmdp            = cdb;
+	io.dxfer_direction = SG_DXFER_NONE;
+	io.sbp             = sense;
+	io.mx_sb_len       = sizeof(sense);
+	io.timeout         = CMD_TIMEOUT_MS;
+
+	if (ioctl(fd, SG_IO, &io) < 0) return -1;
+	if (io.status || io.host_status || io.driver_status) return -2;
+	return 0;
+}
+
+// Where the head actually is, straight from the drive's sub-channel. Lets the
+// mirror re-sync instead of assuming, and tells us whether it is still playing.
+static int mirror_subq(int fd, int *lba_out, int *playing_out)
+{
+	uint8_t cdb[10] = { 0 };
+	uint8_t sense[32];
+	uint8_t data[16];
+	struct sg_io_hdr io;
+
+	cdb[0] = 0x42;                      // READ SUB-CHANNEL
+	cdb[2] = 0x40;                      // SUBQ
+	cdb[3] = 0x01;                      // current position
+	cdb[8] = sizeof(data);
+
+	memset(&io, 0, sizeof(io));
+	io.interface_id    = 'S';
+	io.cmd_len         = 10;
+	io.cmdp            = cdb;
+	io.dxfer_direction = SG_DXFER_FROM_DEV;
+	io.dxfer_len       = sizeof(data);
+	io.dxferp          = data;
+	io.sbp             = sense;
+	io.mx_sb_len       = sizeof(sense);
+	io.timeout         = CMD_TIMEOUT_MS;
+
+	if (ioctl(fd, SG_IO, &io) < 0) return -1;
+	if (io.status || io.host_status || io.driver_status) return -2;
+
+	if (playing_out) *playing_out = (data[1] == 0x11);
+	if (lba_out)
+		*lba_out = (data[8] << 24) | (data[9] << 16) | (data[10] << 8) | data[11];
+	return 0;
+}
+
 static void mirror_spin(int fd, int start)
 {
 	uint8_t cdb[6] = { 0 };
@@ -327,8 +449,21 @@ static int mirror_acquire(void)
 		e.cdte_format = CDROM_LBA;
 		if (ioctl(fd, CDROMREADTOCENTRY, &e) < 0) { close(fd); continue; }
 
+		// Is there an audio track to play? That decides everything about how
+		// this disc gets used, because audio playback is the only way to make
+		// the drive turn at a console's speed.
+		int first_audio = -1;
+		for (int t = hdr.cdth_trk0; t <= hdr.cdth_trk1; t++) {
+			struct cdrom_tocentry te;
+			memset(&te, 0, sizeof(te));
+			te.cdte_track  = t;
+			te.cdte_format = CDROM_LBA;
+			if (ioctl(fd, CDROMREADTOCENTRY, &te) < 0) continue;
+			if (!(te.cdte_ctrl & CDROM_DATA_TRACK)) { first_audio = te.cdte_addr.lba; break; }
+		}
+
 		mir.disc_span = e.cdte_addr.lba;
-		mir.span_lo   = 0;
+		mir.span_lo   = (first_audio > 0) ? first_audio : 0;
 		mir.span_hi   = mir.disc_span - BURST_MAX - END_GUARD_SECTORS;
 		if (mir.span_hi < mir.span_lo) mir.span_hi = mir.span_lo;
 
@@ -336,26 +471,41 @@ static int mirror_acquire(void)
 		mir.r_lo = media_radius_mm(mir.span_lo);
 		mir.r_hi = media_radius_mm(mir.span_hi);
 
-		mir.no_read  = 0;
-		mir.shrinks  = 0;
+		mir.no_read   = 0;
+		mir.shrinks   = 0;
+		mir.play_mode = 0;
 		mir.dev_fd   = fd;
 
-		// Pick the read command once, here, by trying them. READ(10)+FUA is
-		// preferred because FUA is what forces real media access; READ CD is
-		// the fallback that also works on an audio or mixed-mode disc, where
-		// READ(10) cannot touch a CD-DA sector at all.
-		mir.raw_read = 0;
-		if (mirror_read(fd, mir.span_lo, 2, CMD_TIMEOUT_MS)) {
-			mir.raw_read = 1;
-			if (mirror_read_raw(fd, mir.span_lo, 2, CMD_TIMEOUT_MS)) {
-				mir.raw_read = 0;
-				mir.no_read  = 1;
-				acu_log("neither READ(10) nor READ CD works: seek-only\n");
+		// Prefer PLAY AUDIO where the disc allows it: it is the only mode that
+		// runs the mechanism at a console's speed instead of 12-19x.
+		mir.play_mode = 0;
+		if (first_audio >= 0) {
+			int blocks = mir.span_hi - mir.span_lo;
+			if (!mirror_play(fd, mir.span_lo, blocks > 0 ? blocks : 1)) {
+				int pos = 0, playing = 0;
+				if (!mirror_subq(fd, &pos, &playing) && playing) mir.play_mode = 1;
+				mirror_stop_play(fd);
 			}
 		}
-		acu_log("read mode: %s\n", mir.no_read ? "seek-only"
-		                        : mir.raw_read ? "READ CD raw 2352"
-		                                       : "READ(10)+FUA");
+
+		if (!mir.play_mode) {
+			// No audio to play: fall back to reads. FUA is what forces real
+			// media access rather than a cache hit; READ CD also works on a
+			// CD-DA sector, which READ(10) cannot touch at all.
+			mir.raw_read = 0;
+			if (mirror_read(fd, mir.span_lo, 2, CMD_TIMEOUT_MS)) {
+				mir.raw_read = 1;
+				if (mirror_read_raw(fd, mir.span_lo, 2, CMD_TIMEOUT_MS)) {
+					mir.raw_read = 0;
+					mir.no_read  = 1;
+				}
+			}
+		}
+
+		acu_log("drive mode: %s\n",
+		        mir.play_mode ? "PLAY AUDIO (true 1x CLV)"
+		        : mir.no_read ? "seek-only"
+		        : mir.raw_read ? "READ CD raw 2352" : "READ(10)+FUA");
 
 		// How far the disc is really readable is discovered during play, by
 		// pulling the span in when a read fails (see touch()). Probing it up
@@ -584,6 +734,99 @@ static void play_gesture(const gesture_t *g)
 	int ra       = model.drive.readahead_sectors;
 	if (ra < 1) ra = 1;
 	if (ra > BURST_MAX) ra = BURST_MAX;
+
+	// ---- PLAY AUDIO mode -------------------------------------------------
+	// The drive advances the head itself at a true 1x, so most of the time the
+	// right thing to do is nothing at all. We only intervene to put the head
+	// somewhere else, which is exactly what a seek is.
+	if (mir.play_mode) {
+		int tail = mir.span_hi - target;
+		if (tail < 1) tail = 1;
+
+		switch (g->kind) {
+
+		case GEST_JUMP:
+			// Lens jump: the sled does not move and playback does not break.
+			break;
+
+		case GEST_STREAM: {
+			// Only re-issue if the drive has drifted away from where the model
+			// thinks the head should be. A 1x profile needs almost no nudging;
+			// a 2x one needs a small jump now and then, because audio playback
+			// is 1x and cannot be made faster.
+			int pos = 0, playing = 0;
+			if (mirror_subq(mir.dev_fd, &pos, &playing)) { playing = 0; pos = -1; }
+			int drift = (pos < 0) ? INT_MAX : (pos > target ? pos - target : target - pos);
+			if (!playing || drift > 400) mirror_play(mir.dev_fd, target, tail);
+			sleep_ms(g->dur_ms - (clock_ms() - start));
+			break;
+		}
+
+		case GEST_STEP:
+			mirror_play(mir.dev_fd, target, tail);
+			sleep_ms(g->dur_ms - (clock_ms() - start));
+			break;
+
+		case GEST_SLEW: {
+			static const double two[]   = { 0.85, 1.0 };
+			static const double three[] = { 0.60, 0.92, 1.0 };
+			const double *frac = (g->stages >= 3) ? three : two;
+			int n = (g->stages >= 3) ? 3 : 2;
+			double slot = g->dur_ms / n;
+			double rf = media_radius_mm(from), rt = media_radius_mm(target);
+			for (int i = 0; i < n; i++) {
+				if (!mir.on || mir.held || mir.phys_session || mir.dev_fd < 0) break;
+				int stop_lba = media_lba_at_radius(rf + (rt - rf) * frac[i]);
+				int blk = mir.span_hi - stop_lba; if (blk < 1) blk = 1;
+				double t0 = clock_ms();
+				mirror_play(mir.dev_fd, stop_lba, blk);
+				sleep_ms(slot - (clock_ms() - t0));
+			}
+			break;
+		}
+
+		case GEST_HOLD:
+			// Spindle on, head held: that is exactly audio pause.
+			mirror_pause(mir.dev_fd, 0);
+			sleep_ms(g->dur_ms);
+			break;
+
+		case GEST_SPINUP:
+			mirror_spin(mir.dev_fd, 1);
+			mirror_play(mir.dev_fd, target, tail);
+			sleep_ms(g->dur_ms - (clock_ms() - start));
+			break;
+
+		case GEST_SPINDOWN:
+			mirror_stop_play(mir.dev_fd);
+			if (own_device()) mirror_spin(mir.dev_fd, 0);
+			break;
+
+		case GEST_SWEEP: {
+			int pts[3] = { mir.span_lo, mir.span_hi, mir.span_lo };
+			double slot = g->dur_ms / 3.0;
+			for (int i = 0; i < 3; i++) {
+				if (!mir.on || mir.held || mir.phys_session || mir.dev_fd < 0) break;
+				int blk = mir.span_hi - pts[i]; if (blk < 1) blk = 1;
+				double t0 = clock_ms();
+				mirror_play(mir.dev_fd, pts[i], blk);
+				sleep_ms(slot - (clock_ms() - t0));
+			}
+			break;
+		}
+
+		case GEST_PARK:
+			mirror_play(mir.dev_fd, mir.span_lo, 1000);
+			sleep_ms(g->dur_ms - (clock_ms() - start));
+			mirror_stop_play(mir.dev_fd);
+			if (own_device()) mirror_spin(mir.dev_fd, 0);
+			break;
+
+		default:
+			break;
+		}
+		return;
+	}
 
 	switch (g->kind) {
 

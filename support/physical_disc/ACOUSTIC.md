@@ -164,3 +164,32 @@ will spin up and chatter even though the core is reading from an image.
 * The drive cannot be made to take a specific time over a seek; the engine
   issues the ops that move it the right distance and holds the remainder of
   each gesture's slot so the *rhythm* is right.
+
+## PLAY AUDIO mode: how to get a console speed out of a modern drive
+
+A data read on a modern USB drive cannot be slowed down. Measured on a
+DE10-Nano's slot-load drive: `SET CD SPEED` is accepted and ignored, requesting
+1x gives ~12x and anything above that gives ~19x. A Mega CD is 1x. No amount of
+software makes a 19x spindle sound like a 1x one.
+
+Audio playback is the way out, because it has to be real time. `PLAY AUDIO`
+(0x45) was measured at **75.1 sectors/s, 1.002x** on the same drive -- a true 1x
+CLV. It also gives three things for free:
+
+* the spindle glides with radius exactly as CLV requires, because it really is
+  CLV;
+* the head advances itself, so streaming needs no commands at all;
+* nothing can come from cache, because the drive is decoding as it goes.
+
+Re-issuing `PLAY` at another address is a real sled seek -- 288 ms measured for
+a 120000-sector jump -- so one mechanism covers both streaming and seeking.
+`HOLD` maps onto audio pause, which is precisely "spindle on, head still".
+
+**So the best mirror disc is a full audio CD.** The engine detects audio tracks
+and selects this mode automatically; with a 74-minute music CD the usable
+stroke is the full 24-56 mm, against 2.3 mm for a part-written data disc. The
+read-based modes remain as fallbacks for a data-only disc.
+
+With a full stroke and a genuine 1x spindle, `PHYSICAL_DISC_ACOUSTIC_GAIN` has
+much less work to do; try 1 (faithful) first and only raise it if the
+file-system hops are still too small to hear.
