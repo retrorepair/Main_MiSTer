@@ -352,6 +352,14 @@ int cdd_t::SwapPhys()
 	this->audioLength = 0;
 	this->audioOffset = 0;
 	this->chd_audio_read_lba = 0;
+
+	// A disc is in and readable: spin up, sweep the servo, read the lead-in.
+	// Driving this from the mount rather than from CD_COMM_TRAY_CLOSE matters,
+	// because a core booted straight into a game never sends a tray command --
+	// and the start-up sequence is the most recognisable noise the deck makes.
+	physical_disc_acoustic_event(PD_ACU_TRAY_CLOSE, 0, 0);
+	physical_disc_acoustic_event(PD_ACU_TOC, 0, 0);
+
 	return 1;
 }
 

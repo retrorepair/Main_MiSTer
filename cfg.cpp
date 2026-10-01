@@ -75,7 +75,7 @@ static const ini_var_t ini_vars[] =
 
 	{ "PHYSICAL_DISC_MGL", (void*)(&(cfg.physical_disc_launch)), UINT8, 0, 1 },
 	{ "PHYSICAL_DISC_MOUNT_DELAY", (void*)(&(cfg.physical_disc_mount_delay)), UINT8, 0, 30 },
-	{ "PHYSICAL_DISC_ACOUSTIC", (void*)(&(cfg.physical_disc_acoustic)), UINT8, 0, 1 },
+	{ "PHYSICAL_DISC_ACOUSTIC", (void*)(&(cfg.physical_disc_acoustic)), UINT8, 0, 2 },
 	{ "PHYSICAL_DISC_ACOUSTIC_PROFILE", (void*)(&(cfg.physical_disc_acoustic_profile)), UINT8, 0, 7 },
 	{ "AUDIOCD", (void*)(cfg.physical_disc_audio_cd), STRING, 0, sizeof(cfg.physical_disc_audio_cd) - 1 },
 	{ "DVD", (void*)(cfg.physical_disc_dvd), STRING, 0, sizeof(cfg.physical_disc_dvd) - 1 },

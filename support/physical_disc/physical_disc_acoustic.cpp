@@ -1,4 +1,5 @@
 #include <stdio.h>
+#include <stdarg.h>
 #include <string.h>
 #include <stdint.h>
 #include <math.h>
@@ -30,10 +31,39 @@
 #define CMD_TIMEOUT_MS           4000
 #define EVENT_RING               256
 
-// A console drive runs at 1x or 2x. Pinning the mirror drive low keeps its own
-// noise floor in the right place and stops it finishing every gesture before
-// the gesture is supposed to be over.
-#define MIRROR_SPEED_X           4
+// PHYSICAL_DISC_ACOUSTIC=2 traces every gesture. Invaluable for tuning by ear:
+// you can see what the model thought the drive should be doing at the moment
+// you heard the wrong thing.
+//
+// The trace goes to its own file rather than stdout. MiSTer's console output
+// is not reliably reachable -- it is line-buffered to whatever the launcher
+// happened to hand it, and the physical-disc launcher forks children that
+// reopen the standard streams -- so a trace printed to stdout can simply
+// vanish. A file we open and flush ourselves always arrives.
+#define ACU_TRACE_PATH "/tmp/acoustic.log"
+#define verbose() (cfg.physical_disc_acoustic >= 2)
+
+static FILE *acu_trace;
+
+static void acu_log(const char *fmt, ...)
+{
+	if (!verbose()) return;
+	if (!acu_trace) {
+		acu_trace = fopen(ACU_TRACE_PATH, "w");
+		if (!acu_trace) return;
+		setvbuf(acu_trace, NULL, _IOLBF, 0);
+	}
+
+	struct timespec ts;
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	fprintf(acu_trace, "[%8.3f] ", ts.tv_sec + ts.tv_nsec / 1e9);
+
+	va_list ap;
+	va_start(ap, fmt);
+	vfprintf(acu_trace, fmt, ap);
+	va_end(ap);
+	fflush(acu_trace);
+}
 
 // Program area of the media in the drive. Both CDs and DVDs run from roughly
 // 24 mm to 58 mm, so only the sector capacity differs.
@@ -56,6 +86,7 @@ typedef struct {
 	volatile int alive;
 	volatile int disabled_perm;
 	volatile int no_read;
+	volatile int raw_read;   // drive accepts READ CD (0xBE), so audio works too
 	volatile int profile_req;
 
 	// Set while physical_disc owns the drive. The mirror must be completely
@@ -81,7 +112,7 @@ typedef struct {
 
 static mirror_state_t mir;
 static acu_model_t model;
-static uint8_t burst_buf[BURST_MAX * 2048];
+static uint8_t burst_buf[BURST_MAX * 2352];   // raw sectors: READ CD returns 2352
 
 static double clock_ms(void)
 {
@@ -119,6 +150,50 @@ static int mirror_seek(int fd, int lba)
 	io.cmd_len         = 10;
 	io.cmdp            = cdb;
 	io.dxfer_direction = SG_DXFER_NONE;
+	io.sbp             = sense;
+	io.mx_sb_len       = sizeof(sense);
+	io.timeout         = CMD_TIMEOUT_MS;
+
+	if (ioctl(fd, SG_IO, &io) < 0) return -1;
+	if (io.status || io.host_status || io.driver_status) return -2;
+	return 0;
+}
+
+// READ CD, raw 2352-byte sectors, any sector type.
+//
+// The scrap disc people leave in the drive is very often an audio or
+// mixed-mode CD, and READ(10) cannot touch a CD-DA sector at all -- it only
+// understands 2048-byte data blocks. Falling back to seek-only for that is a
+// big loss, because a drive that is reading sounds quite different from one
+// that is merely stepping. READ CD reads both kinds, so the whole disc stays
+// usable as mirror surface and the full radial stroke stays available.
+static int mirror_read_raw(int fd, int lba, int blocks)
+{
+	uint8_t cdb[12] = { 0 };
+	uint8_t sense[32];
+	struct sg_io_hdr io;
+
+	if (blocks < 1) blocks = 1;
+	if (blocks > BURST_MAX) blocks = BURST_MAX;
+
+	cdb[0] = 0xBE;                      // READ CD
+	cdb[1] = 0x00;                      // any sector type
+	cdb[2] = (lba >> 24) & 0xFF;
+	cdb[3] = (lba >> 16) & 0xFF;
+	cdb[4] = (lba >> 8) & 0xFF;
+	cdb[5] = lba & 0xFF;
+	cdb[6] = (blocks >> 16) & 0xFF;
+	cdb[7] = (blocks >> 8) & 0xFF;
+	cdb[8] = blocks & 0xFF;
+	cdb[9] = 0xF8;                      // sync + headers + user data + EDC
+
+	memset(&io, 0, sizeof(io));
+	io.interface_id    = 'S';
+	io.cmd_len         = 12;
+	io.cmdp            = cdb;
+	io.dxfer_direction = SG_DXFER_FROM_DEV;
+	io.dxfer_len       = blocks * 2352;
+	io.dxferp          = burst_buf;
 	io.sbp             = sense;
 	io.mx_sb_len       = sizeof(sense);
 	io.timeout         = CMD_TIMEOUT_MS;
@@ -254,19 +329,30 @@ static int mirror_acquire(void)
 		mir.r_lo = media_radius_mm(mir.span_lo);
 		mir.r_hi = media_radius_mm(mir.span_hi);
 
-		mir.no_read = 0;
-		mir.dev_fd  = fd;
+		mir.no_read  = 0;
+		mir.raw_read = 1;   // try READ CD first; touch() downgrades if refused
+		mir.dev_fd   = fd;
 
-		// One speed change, at open. Changing it mid-play (as the old code
-		// did, to vary loudness) is slow, often ignored over USB, and audible
-		// in a way no console drive ever was.
-		ioctl(fd, CDROM_SELECT_SPEED, MIRROR_SPEED_X);
+		// Lock the drive to the speed the console's own mechanism ran at. A
+		// Mega CD is 1x; letting a modern drive sit at 4x or faster gives a
+		// high steady whine that sounds nothing like the real thing, and it
+		// finishes every gesture long before the gesture is supposed to end.
+		// One change, at open: doing it mid-play is slow and often ignored.
+		int want_x = (int)(model.drive.data_speed + 0.5);
+		if (want_x < 1) want_x = 1;
+		ioctl(fd, CDROM_SELECT_SPEED, want_x);
+
+		acu_log("acquired %s: %d sectors, stroke %.1f-%.1f mm, %s media, "
+		        "locked to %dx, profile %s\n",
+		        path, mir.disc_span, mir.r_lo, mir.r_hi,
+		        (mir.disc_span > DVD_SPAN_THRESHOLD) ? "DVD" : "CD",
+		        want_x, model.drive.name);
 
 		static int last_logged_span = -1;
 		if (mir.disc_span != last_logged_span) {
 			printf("physical_disc_acoustic: mirror disc on %s, %d sectors, "
-			       "stroke %.1f-%.1f mm\n",
-			       path, mir.disc_span, mir.r_lo, mir.r_hi);
+			       "stroke %.1f-%.1f mm, locked to %dx\n",
+			       path, mir.disc_span, mir.r_lo, mir.r_hi, want_x);
 			last_logged_span = mir.disc_span;
 		}
 		return 0;
@@ -299,8 +385,13 @@ static int touch(int lba, int blocks)
 	if (lba < mir.span_lo) lba = mir.span_lo;
 	if (lba > mir.span_hi) lba = mir.span_hi;
 
-	int r = mir.no_read ? mirror_seek(mir.dev_fd, lba)
-	                    : mirror_read(mir.dev_fd, lba, blocks);
+	// Prefer raw reads: they work on data and audio alike, so the whole disc
+	// is usable surface. Drop to READ(10) if the drive has no READ CD, and to
+	// seek-only if it will not read at all.
+	int r;
+	if (mir.no_read)        r = mirror_seek(mir.dev_fd, lba);
+	else if (mir.raw_read)  r = mirror_read_raw(mir.dev_fd, lba, blocks);
+	else                    r = mirror_read(mir.dev_fd, lba, blocks);
 
 	if (r == 0) { read_faults = seek_faults = reopen_faults = 0; return 0; }
 
@@ -322,10 +413,21 @@ static int touch(int lba, int blocks)
 			mirror_release();
 		}
 	}
+	else if (mir.raw_read && ++read_faults >= READ_FAIL_LIMIT) {
+		// READ CD is refused: try plain READ(10) before giving up on reading.
+		acu_log("READ CD rejected at lba %d, falling back to READ(10)\n", lba);
+		mir.raw_read = 0;
+		read_faults  = 0;
+	}
 	else if (++read_faults >= READ_FAIL_LIMIT) {
-		printf("physical_disc_acoustic: drive rejects READ(10), seek-only fallback\n");
+		printf("physical_disc_acoustic: READ(10) rejected at lba %d, seek-only fallback "
+		       "(an audio CD in the drive will do this -- CD-DA sectors are not "
+		       "readable as 2048-byte blocks)\n", lba);
 		mir.no_read = 1;
 		read_faults = 0;
+	}
+	else {
+		acu_log("read fail r=%d at lba %d (%d/%d)\n", r, lba, read_faults, READ_FAIL_LIMIT);
 	}
 	return -1;
 }
@@ -349,6 +451,12 @@ static void play_gesture(const gesture_t *g)
 	double start = clock_ms();
 	int target   = map_to_mirror(g->lba);
 	int from     = map_to_mirror(g->from_lba);
+
+	acu_log("%-8s game %7d->%-7d  mirror %7d->%-7d  %8.1f turns "
+	        "%6.3fmm %5.0frpm %5.0fms x%d%s\n",
+	        acu_gesture_name(g->kind), g->from_lba, g->lba, from, target,
+	        g->turns, g->radial_mm, g->rpm, g->dur_ms, g->stages,
+	        mir.no_read ? " [SEEK-ONLY]" : "");
 	int ra       = model.drive.readahead_sectors;
 	if (ra < 1) ra = 1;
 	if (ra > BURST_MAX) ra = BURST_MAX;
@@ -534,6 +642,9 @@ void physical_disc_acoustic_config(int enabled)
 		mir.dev_fd     = -1;
 		mir.media_full = MEDIA_FULL_CD;
 	}
+
+	acu_log("config(enabled=%d) cfg=%d alive=%d\n",
+	        enabled, cfg.physical_disc_acoustic, mir.alive);
 
 	mir.on = enabled ? 1 : 0;
 	if (mir.on && !mir.alive) {
