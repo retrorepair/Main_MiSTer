@@ -431,7 +431,7 @@ static int map_to_mirror(int game_lba)
 
 static int mirror_acquire(void)
 {
-	if (mir.phys_session || physical_disc_drive_busy()) return -1;
+	if (mir.phys_session) return -1;
 
 	for (int i = 0; i < 8; i++) {
 		char path[32];
@@ -563,7 +563,7 @@ static int touch(int lba, int blocks)
 	// physical disc session can claim the drive at any point, and one stray
 	// SCSI command issued to the disc the user is actually playing is enough
 	// to stall a load.
-	if (mir.phys_session || physical_disc_drive_busy()) {
+	if (mir.phys_session) {
 		mirror_release();
 		return -1;
 	}
@@ -654,7 +654,7 @@ static int touch(int lba, int blocks)
 // hung core -- so they are never issued without checking this first.
 static int own_device(void)
 {
-	return mir.dev_fd >= 0 && !mir.phys_session && !physical_disc_drive_busy();
+	return mir.dev_fd >= 0 && !mir.phys_session;
 }
 
 // ------------------------------------------------------------- grime -------
@@ -1254,14 +1254,17 @@ static void *worker_main(void *arg)
 			printf("physical_disc_acoustic: imitating the %s drive\n", model.drive.name);
 		}
 
-		if (physical_disc_drive_busy()) {
-			// The real disc is being read for data; that drive noise is
-			// genuine and we must not fight it for the device.
-			mirror_release();
-			mir.ring_head = mir.ring_tail;
-			sleep_ms(200);
-			continue;
-		}
+		// Deliberately NOT gated on physical_disc_drive_busy() any more. That
+		// reports only "physical_disc has the device open", which is not the
+		// same thing as "the game is being served off the disc". The PSX
+		// launcher opens the drive speculatively to watch for a disc swap and
+		// never closes it, so gating on it silenced the mirror for the whole
+		// session even when the game was plainly running from a CHD.
+		//
+		// phys_session is the authoritative answer: set when physical_disc
+		// takes the device, and corrected by whichever core mounts a disc,
+		// which is the only place that knows whether the game is coming off
+		// the disc or off an image.
 
 		double now = clock_ms();
 

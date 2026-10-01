@@ -1060,6 +1060,15 @@ int psx_mount_cd(int f_index, int s_index, const char *filename)
 			mount_cd(toc.end*CD_SECTOR_LEN, s_index);
 			loaded = 1;
 
+			// Whether the game is really coming off the disc. The launcher
+			// opens the drive for PSX regardless, to watch for a swap, and
+			// never closes it -- so only the mount knows the truth, and without
+			// this the mirror stayed muted for the whole session even with a
+			// CHD plainly loaded. Swap detection is off for an image mount
+			// (physical_disc_swap_enable(0) above), so the mirror using the
+			// drive cannot provoke a spurious disc change.
+			physical_disc_acoustic_set_physical(toc.phys);
+
 			// Disc accepted: lid shut, spin up, servo sweep, then back to the
 			// lead-in for the TOC. This is the PlayStation's start-up noise,
 			// and it is the part of the sound nobody was getting before.

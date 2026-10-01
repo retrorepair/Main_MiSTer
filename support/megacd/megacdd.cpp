@@ -353,6 +353,8 @@ int cdd_t::SwapPhys()
 	this->audioOffset = 0;
 	this->chd_audio_read_lba = 0;
 
+	physical_disc_acoustic_set_physical(this->toc.phys);
+
 	// A disc is in and readable: spin up, sweep the servo, read the lead-in.
 	// Driving this from the mount rather than from CD_COMM_TRAY_CLOSE matters,
 	// because a core booted straight into a game never sends a tray command --
