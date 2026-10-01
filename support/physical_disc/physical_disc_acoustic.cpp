@@ -776,7 +776,13 @@ static void grime_grind(int from_lba, int to_lba, double total_ms)
 
 		// Overshoot past the target, alternating side and shrinking each time,
 		// so it closes in rather than flailing.
-		double over = (dist * 0.35 + 2.0) / (i + 1);
+		//
+		// The floor matters more than the proportional part. Most in-game seeks
+		// are short hops within the data track, and a short hop is 30 ms of
+		// near-silence on this drive however faithfully it is reproduced. The
+		// overshoot is what turns one into real audible travel, so it scales
+		// with the grime level rather than only with the distance.
+		double over = (dist * 0.35 + 1.5 + grime_level() * 0.9) / (i + 1);
 		if (i & 1) over = -over;
 		int at = lba_offset_mm(to_lba, span > 0 ? over : -over);
 
@@ -971,10 +977,26 @@ static void play_gesture(const gesture_t *g)
 			break;
 		}
 
-		case GEST_STEP:
-			mirror_play(mir.dev_fd, target, tail);
-			sleep_ms(g->dur_ms - (clock_ms() - start));
+		case GEST_STEP: {
+			// STEP was going straight out as one quiet PLAY with no grime at
+			// all, and STEP is the commonest move there is during a load -- a
+			// short hop between files on the data track. Those were all
+			// bypassing everything.
+			//
+			// It also needs the grime more than a long seek does, not less. A
+			// Mega CD takes about 305 ms over a short step; this drive does the
+			// same move in 30 ms, so left alone it is a blip. The overshoot
+			// passes are what give it any duration or travel.
+			int gl = grime_level();
+			if (gl) {
+				grime_grind(from, target, g->dur_ms * (1.0 + gl * 0.30));
+			}
+			else {
+				mirror_play(mir.dev_fd, target, tail);
+				sleep_ms(g->dur_ms - (clock_ms() - start));
+			}
 			break;
+		}
 
 		case GEST_SLEW: {
 			int gl = grime_level();
