@@ -28,7 +28,10 @@ static const acu_drive_t drives[PD_ACU_PROFILE_COUNT] = {
 	// crossing the whole disc. See acu_model_seek_ms().
 	//
 	// name       data audio jump short settle base stroke spinup sdown  ra sweep lock
-	{ "auto",      2.0, 1.0,  32,  640,   30,   160,  1200,  1500, 8000,  8, 0,   4 },
+	// sweep is 1: every real deck in this table calibrates on a disc insert, so
+	// the fallback should too. At 0 the boot sweep was skipped whenever no core
+	// had yet claimed a profile, which is exactly when the boot happens.
+	{ "auto",      2.0, 1.0,  32,  640,   30,   160,  1200,  1500, 8000,  8, 1,   4 },
 	// PlayStation: Sony KSM-440, 2x data / 1x audio. Fast, chattery sled.
 	// base 100 ms, stroke 900 ms and spin-up 1000 ms are DuckStation's figures
 	// (src/core/cdrom.cpp): a medium seek costs 0.05-0.1 s, a sled seek
@@ -280,14 +283,27 @@ void acu_model_event(acu_model_t *m, double now_ms, pd_acoustic_event_t ev, int 
 	switch (ev) {
 
 	case PD_ACU_SPINUP:
+		// A resume: spin up if stopped, nothing more. No calibration -- the disc
+		// has not been out.
+		ensure_spinning(m);
+		break;
+
 	case PD_ACU_TRAY_CLOSE:
-		if (!m->spinning) {
-			m->spinning = 1;
-			simple(m, GEST_SPINUP, m->head_lba, d->spinup_ms, d->data_speed);
+		// A disc has just been loaded, so the deck calibrates whatever we
+		// happen to think the spindle is doing. The sweep used to sit behind
+		// "if not already spinning", and a core reads its disc header before it
+		// announces the mount -- so that read span up the modelled spindle
+		// first and the boot sweep was skipped every single time. It is the
+		// longest travel the mechanism ever makes and the most recognisable
+		// thing about a console starting up, and it was never once played.
+		{
+			if (!m->spinning) {
+				m->spinning = 1;
+				m->holding  = 0;
+				simple(m, GEST_SPINUP, m->head_lba, d->spinup_ms, d->data_speed);
+			}
 			// These decks drag the sled across the disc once to calibrate the
-			// focus and tracking servos before they can read the TOC. It is
-			// the loudest thing the drive ever does, and it is the sound
-			// people recognise as "the console is booting".
+			// focus and tracking servos before they can read the TOC.
 			if (d->calib_sweep) {
 				gesture_t g;
 				memset(&g, 0, sizeof(g));

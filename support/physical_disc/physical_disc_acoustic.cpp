@@ -1317,6 +1317,15 @@ static void *worker_main(void *arg)
 			applied_profile = mir.profile_req;
 			acu_model_init(&model, (pd_acoustic_profile_t)applied_profile);
 			printf("physical_disc_acoustic: imitating the %s drive\n", model.drive.name);
+
+			// A profile change means a core has just mounted a disc, so this is
+			// the moment that deck calibrates. It also has to be re-issued here
+			// because acu_model_init() clears the gesture queue: the boot
+			// sequence queued at enable time was being wiped by the very profile
+			// change that told us which drive to imitate, so the sweep was
+			// emitted and then discarded before it could ever be played.
+			acu_model_event(&model, clock_ms(), PD_ACU_TRAY_CLOSE, 0, 0);
+			acu_model_event(&model, clock_ms(), PD_ACU_TOC, 0, 0);
 		}
 
 		// Deliberately NOT gated on physical_disc_drive_busy() any more. That
@@ -1475,6 +1484,20 @@ void physical_disc_acoustic_config(int enabled)
 			return;
 		}
 		printf("physical_disc_acoustic: enabled - put a spare disc in the drive\n");
+
+		// Synthesise the power-on sequence here, because the real one is always
+		// missed. A core mounts its disc inside user_io_init(), and this engine
+		// is not enabled until physical_disc_launch_startup() a few lines later
+		// in main() -- so the mount's tray-close and TOC events are emitted
+		// while the worker is still parked, and the parked worker flushes the
+		// ring. The boot sweep, which is the longest travel the mechanism ever
+		// makes and the most recognisable part of a console starting up, was
+		// therefore never played once.
+		//
+		// Enabling the mirror is itself the moment a console comes on, so the
+		// sequence belongs here regardless.
+		physical_disc_acoustic_event(PD_ACU_TRAY_CLOSE, 0, 0);
+		physical_disc_acoustic_event(PD_ACU_TOC, 0, 0);
 	}
 }
 
