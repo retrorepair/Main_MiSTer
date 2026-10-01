@@ -70,8 +70,12 @@ typedef struct {
 	int    holding;
 	int    just_moved;        // repositioned and not yet started reading there
 
-	gesture_t out[8];
+	// Deep enough to hold a whole burst. At 8 a scene transition could fill it
+	// with real events and then have to start dropping them, which lost about a
+	// quarter of all seeks -- measured: 94 requested, 69 played.
+	gesture_t out[32];
 	int    out_head, out_tail;
+	unsigned dropped_events;  // real events lost to a full queue; should stay 0
 } acu_model_t;
 
 const acu_drive_t *acu_model_drive(pd_acoustic_profile_t profile);

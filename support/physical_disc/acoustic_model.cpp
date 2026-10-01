@@ -5,6 +5,9 @@
 #include "acoustic_model.h"
 #include "cd_geometry.h"
 
+// Gesture queue depth. Must match the array in acoustic_model.h.
+#define ACU_OUT_MASK 31
+
 // Drive characteristics per console.
 //
 // The seek figures are the published or measured behaviour of the drive
@@ -99,7 +102,7 @@ static int gesture_is_update(gesture_kind_t k)
 
 static void emit(acu_model_t *m, const gesture_t *g)
 {
-	if (((m->out_tail + 1) & 7) == m->out_head) {
+	if (((m->out_tail + 1) & ACU_OUT_MASK) == m->out_head) {
 		// Full. Drop the oldest DISCARDABLE gesture, not simply the oldest.
 		//
 		// Dropping the oldest outright cost the audio lock-on: while the player
@@ -113,35 +116,36 @@ static void emit(acu_model_t *m, const gesture_t *g)
 		// the lock-on in the player, now the lock-on here. Anything that is not
 		// positional is kept.
 		int found = -1;
-		for (int i = m->out_head; i != m->out_tail; i = (i + 1) & 7) {
+		for (int i = m->out_head; i != m->out_tail; i = (i + 1) & ACU_OUT_MASK) {
 			if (gesture_is_update(m->out[i].kind)) { found = i; break; }
 		}
 
 		if (found < 0) {
 			// Every queued gesture is a real event; nothing better to do than
 			// lose the oldest.
-			m->out_head = (m->out_head + 1) & 7;
+			m->out_head = (m->out_head + 1) & ACU_OUT_MASK;
+			m->dropped_events++;
 		}
 		else {
-			int j = found, nxt = (found + 1) & 7;
+			int j = found, nxt = (found + 1) & ACU_OUT_MASK;
 			while (nxt != m->out_tail) {
 				m->out[j] = m->out[nxt];
 				j   = nxt;
-				nxt = (nxt + 1) & 7;
+				nxt = (nxt + 1) & ACU_OUT_MASK;
 			}
 			m->out_tail = j;
 		}
 	}
 
 	m->out[m->out_tail] = *g;
-	m->out_tail = (m->out_tail + 1) & 7;
+	m->out_tail = (m->out_tail + 1) & ACU_OUT_MASK;
 }
 
 int acu_model_poll(acu_model_t *m, gesture_t *out)
 {
 	if (m->out_head == m->out_tail) return 0;
 	*out = m->out[m->out_head];
-	m->out_head = (m->out_head + 1) & 7;
+	m->out_head = (m->out_head + 1) & ACU_OUT_MASK;
 	return 1;
 }
 

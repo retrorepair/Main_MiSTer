@@ -1339,6 +1339,20 @@ static void *worker_main(void *arg)
 		}
 		acu_model_tick(&model, now);
 
+		// Anything lost here is a seek the user never hears, which is exactly
+		// how "it works, sometimes" happens. Both counters should stay at zero;
+		// report them when they move so it is never a guess again.
+		{
+			static unsigned seen_ring = 0, seen_model = 0;
+			if (mir.dropped != seen_ring || model.dropped_events != seen_model) {
+				acu_log("LOST: %u event%s at the ring, %u gesture%s at the model\n",
+				        mir.dropped, mir.dropped == 1 ? "" : "s",
+				        model.dropped_events, model.dropped_events == 1 ? "" : "s");
+				seen_ring  = mir.dropped;
+				seen_model = model.dropped_events;
+			}
+		}
+
 		gesture_t g;
 		if (!acu_model_poll(&model, &g)) {
 			sleep_ms(10);
