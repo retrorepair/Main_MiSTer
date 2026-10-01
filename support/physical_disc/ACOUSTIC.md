@@ -172,6 +172,24 @@ DE10-Nano's slot-load drive: `SET CD SPEED` is accepted and ignored, requesting
 1x gives ~12x and anything above that gives ~19x. A Mega CD is 1x. No amount of
 software makes a 19x spindle sound like a 1x one.
 
+**A period drive is different, and it is worth knowing which you have.** The same
+test on the Mitsumi FX120T, reading raw 2352-byte sectors:
+
+| requested | sectors/s | implied |
+|-----------|-----------|---------|
+| 1x        | 21.7      | 0.29x   |
+| 2x        | 83.9      | 1.12x   |
+| 4x        | 164.7      | 2.20x  |
+| 8x        | 322.9      | 4.31x  |
+| max       | 333.2      | 4.44x   |
+
+Monotonic, and capped around 4.4x. (The absolute figures sit low because each
+`READ CD` of 16 sectors carries its own command overhead; the ratio is the point.)
+So on this drive a spindle speed change is real, and the 1x/2x alternation a PSX
+lives on is available rather than cosmetic. On a Mega CD there is correctly nothing
+to ramp -- it is 1x CLV throughout -- so a flat spindle there is faithful, not a
+fault.
+
 Audio playback is the way out, because it has to be real time. `PLAY AUDIO`
 (0x45) was measured at **75.1 sectors/s, 1.002x** on the same drive -- a true 1x
 CLV. It also gives three things for free:

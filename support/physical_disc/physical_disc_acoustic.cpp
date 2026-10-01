@@ -833,9 +833,16 @@ static void grime_resume(int lba)
 // 16 and 673 over 32. The earlier constants were fitted to the same curve but
 // spent against UNsynchronised seeks costing 1 ms each, so the budget was never
 // the thing being consumed.
-#define STEP_FIXED_MS        150.0
+// ...then re-measured again IN SERVICE, which is the number that matters. On an
+// idle drive a synchronised step costs the 150 ms above; with the core actually
+// running -- audio playing, the read cadence issuing a move every 250 ms -- every
+// command queues behind that, and the same step costs 250-700 ms. Timing the
+// grind's own tail showed it plainly: the overshoot-and-return pair, two moves of
+// 3.5 mm, took 830 and 1369 ms where the bench curve predicted 412. Budgeting
+// against bench figures is what left a long seek 35-50% over its duration.
+#define STEP_FIXED_MS        300.0
 #define STEP_PER_MM_MS        16.0
-#define DRIVE_MIN_SEEK_MS    150.0
+#define DRIVE_MIN_SEEK_MS    300.0
 
 // Every grind ends with an overshoot seek, an arrival seek and a PLAY to put the
 // spindle back to 1x. All three land inside the duration being budgeted, and
@@ -843,11 +850,17 @@ static void grime_resume(int lba)
 // and then the tail ran past it. The two seeks are now synchronised, so they
 // cost real time and are real sled movement -- and a reversal at that, which is
 // worth more acoustically than another step in the same direction.
-#define RESUME_PLAY_MS       250.0
+// Measured at 25-28 ms, not the 250 ms guessed here before: the arrival seek has
+// already put the head where the PLAY wants it, so the PLAY only re-establishes
+// the audio servo rather than moving anything. The guess was spending a fifth of a
+// short seek's whole budget on nothing.
+#define RESUME_PLAY_MS        40.0
 
 static void grime_grind(int from_lba, int to_lba, double total_ms)
 {
 	if (mir.dev_fd < 0 || mir.phys_session) return;
+
+	double grind_start = clock_ms();
 
 	double r0   = media_radius_mm(from_lba);
 	double r1   = media_radius_mm(to_lba);
@@ -895,8 +908,21 @@ static void grime_grind(int from_lba, int to_lba, double total_ms)
 	int  latn = 0;
 	latn += snprintf(lat + latn, sizeof(lat) - latn, "%d steps:", steps);
 
+	// The step count is solved from the median cost curve, but the drive varies a
+	// lot run to run: the same 20.5 mm move has cost 263+288 ms on one pass and
+	// 407+711 ms on the next, which is how a long seek came out at 1.5x. So check
+	// the remaining budget before each step instead of committing to the count up
+	// front. On a fast pass every step is taken; on a slow one the staircase is
+	// cut short rather than running past the duration the game is timing against.
+	double step_cost = STEP_FIXED_MS + STEP_PER_MM_MS * (dist / steps);
+
 	for (int i = 1; i <= steps; i++) {
 		if (mirror_aborted()) break;
+		if (i > 1 && clock_ms() - grind_start + step_cost + tail_ms > total_ms) {
+			if (latn < (int)sizeof(lat) - 8)
+				latn += snprintf(lat + latn, sizeof(lat) - latn, " cut");
+			break;
+		}
 		int at = media_lba_at_radius(r0 + span * ((double)i / steps));
 		double st = clock_ms();
 		mirror_seek_sync(mir.dev_fd, at);
@@ -912,15 +938,26 @@ static void grime_grind(int from_lba, int to_lba, double total_ms)
 	// A worn mechanism overshoots at the end and has to come back. ONE
 	// correction: this is the settle, not the seek, and a sequence of them is
 	// what made every seek sound the same length as every other.
+	// Time the tail as well as the steps. The step budget is only as good as its
+	// estimate of what follows it, and RESUME_PLAY_MS was a guess: a SLEW kept
+	// overrunning by a third even when the staircase had been cut to one step,
+	// which puts the missing time here rather than in the steps.
+	double tail_start = clock_ms();
 	if (grime_level() >= 4 && !mirror_aborted())
 		mirror_seek_sync(mir.dev_fd, lba_offset_mm(to_lba, span > 0 ? over : -over));
 
 	mirror_seek_sync(mir.dev_fd, to_lba);
-	acu_log("  grind %.1fmm over %.0fms, %s\n", dist, total_ms, lat);
+	double seeks_ms = clock_ms() - tail_start;
 
 	// SEEK stops audio playback outright (verified: PLAYING -> DONE), so hand
 	// the spindle back to a true 1x before the mirror carries on.
+	double resume_start = clock_ms();
 	grime_resume(to_lba);
+
+	acu_log("  grind %.1fmm over %.0fms, %s | tail seeks %.0f, resume %.0f, "
+	        "whole %.0f\n",
+	        dist, total_ms, lat, seeks_ms, clock_ms() - resume_start,
+	        clock_ms() - grind_start);
 }
 
 // A worn mechanism does not slip once and recover neatly. It slips, grabs,
@@ -1075,6 +1112,23 @@ static void play_gesture(const gesture_t *g)
 				int drift = (pos < 0) ? INT_MAX
 				          : (pos > target ? pos - target : target - pos);
 				if (!playing || drift > 400) mirror_play(mir.dev_fd, target, tail);
+
+				// A deck's sled does not glide inaudibly for a whole track. It
+				// advances in steps, and a worn one ticks as it tracks outward.
+				// An external head trace showed twelve unbroken seconds parked
+				// at one radius during playback -- faithful to a perfect
+				// mechanism, and the longest silence left in a session.
+				//
+				// One small synchronised nudge every eighth gesture is about a
+				// tick every two seconds. It needs no undoing: 0.25 mm is some
+				// 2500 sectors, well past the 400 the drift check above allows,
+				// so the next gesture pulls the head back and resumes the music
+				// by itself. The drive's own audio output goes nowhere -- only
+				// its mechanical noise is the point -- so breaking playback to
+				// do this costs nothing.
+				if (grime_level() >= 4 && !(grime_rng() % 8))
+					mirror_seek_sync(mir.dev_fd, lba_offset_mm(target, 0.25));
+
 				// A scratched disc makes a CD player hunt and skip mid-track.
 				// Gentler than on a data read, because the drive is not also
 				// fighting to get the sector right.
@@ -1111,9 +1165,20 @@ static void play_gesture(const gesture_t *g)
 					// chattering in place rather than seeking across the disc.
 					// Synchronised, or the sled does not move at all: a bare
 					// SEEK returns in 1 ms and the next one overwrites it. At
-					// 150 ms + 16 ms/mm this costs about 160 ms, which fits
-					// inside the 250 ms gesture, so the player keeps pace.
-					double amp = 0.22 + 0.07 * gl;
+					// 150 ms + 16 ms/mm this costs about 155 ms, which fits
+					// inside the 250 ms gesture, so the player keeps pace. Two
+					// moves would not fit, which is what caps the cadence at
+					// the gesture rate of 4 Hz.
+					//
+					// Small on purpose. What makes a load recognisable is the
+					// RHYTHM, not the distance: a real mechanism ticks rapidly
+					// over a short throw. An external trace of 0.71 mm each way
+					// at 3 Hz came to 4.3 mm/s of continuous sled travel, which
+					// is a grind rather than a cadence. Anything over about
+					// 0.04 mm is sled and not lens, so there is plenty of room
+					// below that -- and the grime level stays a real dial, from
+					// a tick at 1 to a proper churn at 11.
+					double amp = 0.10 + 0.035 * gl;
 					mir.read_phase++;
 					if (mir.read_phase & 1)
 						mirror_seek_sync(mir.dev_fd, lba_offset_mm(target, -amp));
@@ -1193,10 +1258,18 @@ static void play_gesture(const gesture_t *g)
 			// correction a real servo makes while it is locking on.
 			grime_resume(target);
 			double until = start + g->dur_ms;
+			// A correction is two synchronised seeks and a PLAY, so it needs
+			// most of half a second. The loop used to test only the deadline
+			// before starting one, which was harmless while a seek cost 1 ms and
+			// overran by 59% once seeks began to wait: do not start what will not
+			// fit.
+			const double fidget_ms = 2.0 * (STEP_FIXED_MS + STEP_PER_MM_MS * 0.12)
+			                       + RESUME_PLAY_MS;
 			while (clock_ms() < until) {
 				if (!mir.on || mir.held || mir.phys_session || mir.dev_fd < 0) break;
 				sleep_ms(90);
-				if (grime_level() && !(grime_rng() % 4)) {
+				if (grime_level() && !(grime_rng() % 4)
+				    && until - clock_ms() >= fidget_ms) {
 					mirror_seek_sync(mir.dev_fd, lba_offset_mm(target, 0.12));
 					mirror_seek_sync(mir.dev_fd, target);
 					grime_resume(target);

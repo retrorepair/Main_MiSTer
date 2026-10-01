@@ -44,14 +44,24 @@ static const acu_drive_t drives[PD_ACU_PROFILE_COUNT] = {
 	// (2 + 10 interrupts base; "max. seek time = 1.5 s" across 270000 sectors),
 	// which the MiSTer core's own latency model matches. Measured, not guessed.
 	{ "MegaCD",    1.0, 1.0,  24,  480,   55,   160,  1500,  2200, 6000,  4, 1,   6 },
-	// Saturn: 2x. DERIVED, not sourced -- unlike the Mega CD and PSX rows there
-	// is no citable emulator seek model for this drive. MAME's saturn_cdb.cpp
-	// has no timing at all (its CD Block CPU is disabled), and Mednafen's CD
-	// block does not publish a seek curve. So this is the PSX row, which is the
-	// same class of 2x mechanism from the same period, with a slightly slower
-	// and better damped sled. Treat it as the least trustworthy row here after
-	// the auto one, and say so rather than implying it was measured.
-	{ "Saturn",    2.0, 1.0,  32,  360,   30,   110,  1000,  1200, 0,     8, 1,   3 },
+	// Saturn: 2x data / 1x audio. SOURCED -- an earlier note here claimed there
+	// was no citable seek model for this drive, which was wrong. Mednafen's CD
+	// block has one, in ss/cdb.cpp DRIVEPHASE_SEEK_START3:
+	//
+	//   seek_time  = 12 * (44100 * 256) / 150;
+	//   seek_time += abs(fad_delta) * ((fad_delta < 0) ? 28 : 26);
+	//   seek_time += (fad_delta < 0 || fad_delta >= 150) ? (44100 * 256) / 150 : 0;
+	//
+	// At 44100*256 = 11.2896 MHz one sector period is 6.667 ms, so that is an 80 ms
+	// startup, 26 clocks (0.0023 ms) per sector forward, and a 6.7 ms settle on
+	// any backward seek or any move of 150 sectors or more. Hence 87 ms fixed and
+	// 0.0023 * 270000 = 620 ms across the disc -- a full stroke of about 780 ms,
+	// appreciably quicker than the Mega CD's 1.5 s, which fits a newer 2x
+	// mechanism. (Mednafen charges 28 clocks backward against 26 forward, 8% more;
+	// this model has no direction term. The 80 ms startup is also partly
+	// rotational, which rot_ms counts again, so the fixed cost is if anything
+	// slightly generous.)
+	{ "Saturn",    2.0, 1.0,  32,  360,   30,    87,   620,  1200, 0,     8, 1,   3 },
 	// PC Engine CD: 1x, seek curve measured by Dave Shadoff.
 	{ "PCECD",     1.0, 1.0,  24,  644,   50,   283,  2300,  2000, 7000,  4, 1,   5 },
 	// 3DO: 2x on the FZ-10, slow to settle.
