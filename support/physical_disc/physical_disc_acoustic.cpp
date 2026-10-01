@@ -807,13 +807,18 @@ static void grime_grind(int from_lba, int to_lba, double total_ms)
 	double traverse_ms  = 30.0 + 2.4 * (span_sectors / 1000.0);
 	if (traverse_ms < 40.0) traverse_ms = 40.0;
 
-	int passes = (int)(total_ms / traverse_ms + 0.5);
-	passes += grime_level() / 4;                    // wear adds its own hunting
-	if (passes < 1)  passes = 1;
-	if (passes > 10) passes = 10;
-	int surge  = grime_level() >= 8 && !mir.no_read;
+	// Fill that time exactly -- never exceed it. Running to a fixed pass count
+	// overran badly: a Mega CD seek models at 1805 ms, but four passes with a
+	// random 40-130 ms settle between each came to about 3.2 s, so the mirror
+	// was still grinding after the emulated drive had finished and playback had
+	// resumed. That is heard as a long seek during playback, which no real drive
+	// does. Those settles were also the jitter: audible gaps mid-traverse, where
+	// a real sled crossing the disc does not stop on the way.
+	(void)traverse_ms;
+	double deadline = clock_ms() + total_ms;
+	int surge = grime_level() >= 8 && !mir.no_read;
 
-	for (int i = 0; i < passes; i++) {
+	for (int i = 0; i < 10 && clock_ms() < deadline; i++) {
 		if (!mir.on || mir.held || mir.phys_session || mir.dev_fd < 0) break;
 
 		// Overshoot past the target, alternating side and shrinking each time,
@@ -833,8 +838,6 @@ static void grime_grind(int from_lba, int to_lba, double total_ms)
 		// Spindle surge: a raw read spins the drive up hard, and dropping back
 		// lets it fall. Failure is fine -- we want the spin-up, not the bytes.
 		if (surge) mirror_read_raw(mir.dev_fd, at, 24, 700);
-
-		sleep_ms(40 + (grime_rng() % 90));          // let it settle audibly
 	}
 
 	mirror_seek(mir.dev_fd, to_lba);                // finally arrives
@@ -1020,7 +1023,7 @@ static void play_gesture(const gesture_t *g)
 			// passes are what give it any duration or travel.
 			int gl = grime_level();
 			if (gl) {
-				grime_grind(from, target, g->dur_ms * (1.0 + gl * 0.30));
+				grime_grind(from, target, g->dur_ms);
 			}
 			else {
 				mirror_play(mir.dev_fd, target, tail);
@@ -1032,12 +1035,14 @@ static void play_gesture(const gesture_t *g)
 		case GEST_SLEW: {
 			int gl = grime_level();
 			if (gl) {
-				// Grind the whole way across rather than jumping in two or
-				// three stages. A tired sled is also slower than the mechanism
-				// ever was when new, so the traverse is stretched well past
-				// what the model says a healthy one would take.
-				double drag = g->dur_ms * (1.0 + gl * 0.30);
-				grime_grind(from, target, drag);
+				// Grind across for exactly as long as the ORIGINAL drive would
+				// have taken -- no more. Wear changes the character of a seek,
+				// not its duration: the emulated drive reports a seek time and
+				// the game's own timing is built on it, so stretching it by the
+				// grime level (3.1x at level 7) left the mirror grinding long
+				// after the core had resumed playback. Heard as a long seek
+				// during music, which no real drive does.
+				grime_grind(from, target, g->dur_ms);
 				// Then overshoot and come back, which is why an old console
 				// takes two goes to settle before it starts reading.
 				// the grind already overshoots and returns; no extra fidget
@@ -1146,7 +1151,7 @@ static void play_gesture(const gesture_t *g)
 				}
 				// Full stroke out and back: the longest continuous travel the
 				// mechanism ever makes.
-				double leg = g->dur_ms * (1.0 + gl * 0.30) / 2.0;
+				double leg = g->dur_ms / 2.0;
 				grime_grind(mir.span_lo, mir.span_hi, leg);
 				grime_grind(mir.span_hi, mir.span_lo, leg);
 			}

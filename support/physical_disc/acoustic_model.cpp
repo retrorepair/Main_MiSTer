@@ -30,14 +30,25 @@ static const acu_drive_t drives[PD_ACU_PROFILE_COUNT] = {
 	// name       data audio jump short settle base stroke spinup sdown  ra sweep lock
 	{ "auto",      2.0, 1.0,  32,  640,   30,   160,  1200,  1500, 8000,  8, 0,   4 },
 	// PlayStation: Sony KSM-440, 2x data / 1x audio. Fast, chattery sled.
-	{ "PSX",       2.0, 1.0,  32,  640,   25,   120,   800,  1600, 0,     8, 1,   3 },
+	// base 100 ms, stroke 900 ms and spin-up 1000 ms are DuckStation's figures
+	// (src/core/cdrom.cpp): a medium seek costs 0.05-0.1 s, a sled seek
+	// SLED_FIXED_COST 0.05 s plus SLED_VARIABLE_COST up to 0.9 s total, and
+	// spin-up is one second. It also only engages the sled past 7200 sectors,
+	// which is roughly 300 turns at mid-disc -- hence the lower break here.
+	{ "PSX",       2.0, 1.0,  32,  300,   25,   100,   900,  1000, 0,     8, 1,   3 },
 	// Mega CD / Sega CD: 1x only, slow sled, spins down when left idle.
 	// base 160 ms and stroke 1500 ms are Genesis Plus GX's documented figures
 	// (2 + 10 interrupts base; "max. seek time = 1.5 s" across 270000 sectors),
 	// which the MiSTer core's own latency model matches. Measured, not guessed.
 	{ "MegaCD",    1.0, 1.0,  24,  480,   55,   160,  1500,  2200, 6000,  4, 1,   6 },
-	// Saturn: 2x, better damped than the PSX.
-	{ "Saturn",    2.0, 1.0,  32,  640,   30,   130,   900,  1800, 0,     8, 1,   3 },
+	// Saturn: 2x. DERIVED, not sourced -- unlike the Mega CD and PSX rows there
+	// is no citable emulator seek model for this drive. MAME's saturn_cdb.cpp
+	// has no timing at all (its CD Block CPU is disabled), and Mednafen's CD
+	// block does not publish a seek curve. So this is the PSX row, which is the
+	// same class of 2x mechanism from the same period, with a slightly slower
+	// and better damped sled. Treat it as the least trustworthy row here after
+	// the auto one, and say so rather than implying it was measured.
+	{ "Saturn",    2.0, 1.0,  32,  360,   30,   110,  1000,  1200, 0,     8, 1,   3 },
 	// PC Engine CD: 1x, seek curve measured by Dave Shadoff.
 	{ "PCECD",     1.0, 1.0,  24,  644,   50,   283,  2300,  2000, 7000,  4, 1,   5 },
 	// 3DO: 2x on the FZ-10, slow to settle.
