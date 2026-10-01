@@ -98,11 +98,33 @@ by ear without touching any logic. The PC Engine row is Shadoff's measured
 data; the others are scaled from each mechanism's rated access time and are a
 starting point rather than gospel.
 
+## The physical-disc interlock
+
+There is one optical drive, so the mirror and a real physical-disc session can
+never both use it. **A physical disc always wins.**
+
+`physical_disc_open()` calls `physical_disc_acoustic_set_physical(1)` before it
+touches the device, and that call blocks until the mirror confirms it has
+closed its handle. `physical_disc_close()` clears it again. While the latch is
+set the mirror drops every incoming event, refuses to open the device, and
+aborts any gesture already in flight; `touch()` re-checks before *every* SCSI
+command, and `START STOP UNIT` and the speed change additionally require
+`own_device()`.
+
+This matters more than it sounds. The drive is holding the user's actual game
+disc, and `START STOP UNIT (stop)` spins it down — during a core load that
+presents as a black screen, because the core simply never gets its data.
+
+So in practice: **acoustic mirroring applies to image-backed play** (CHD or
+`.cue`/`.bin`) with a disc in the drive to make the noise on. During real
+physical-disc play the drive is already making entirely genuine noise and the
+mirror stays completely out of the way. Note that whatever disc is in the drive
+is what gets seeked — if that is your game disc rather than a scrap one, it
+will spin up and chatter even though the core is reading from an image.
+
 ## Known limits
 
-* The mirror is disabled whenever the real drive is busy serving a physical
-  disc, because that drive noise is already genuine. It does mean that in
-  physical-disc mode the rhythm you hear is the HPS prefetcher's, not the
+* In physical-disc mode the rhythm you hear is the HPS prefetcher's, not the
   console's. Shaping the real read pattern is possible but risks actual data
   delivery, so it is deliberately not done here.
 * USB optical drives vary a lot in how quickly they service `READ(10)` and

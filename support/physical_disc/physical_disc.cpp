@@ -677,6 +677,12 @@ static int find_drive(char *out, int outsz)
 
 int physical_disc_open(const char *dev)
 {
+	// Take the drive away from the acoustic mirror before touching it, and
+	// wait for it to let go. The mirror drives a scrap disc for effect; from
+	// here on the drive is holding the user's actual game disc and must not
+	// receive a single stray command.
+	physical_disc_acoustic_set_physical(1);
+
 	if (dev && *dev) physical_disc_set_device(dev);
 
 	if (drv.dev_fd >= 0) {
@@ -688,11 +694,19 @@ int physical_disc_open(const char *dev)
 	if (drv.dev_fd < 0) {
 		active_dev[0] = 0;
 		printf("DISC: no cd-rom drive found (looked at /dev/sr0../dev/sr7)\n");
+		// We never took the drive, so give the mirror its permission back --
+		// otherwise a failed probe silences it for the rest of the session.
+		physical_disc_acoustic_set_physical(0);
 		return -1;
 	}
 
 	drv.ring = (cache_entry_t *)malloc(sizeof(cache_entry_t) * RING_SECTORS);
-	if (!drv.ring) { close(drv.dev_fd); drv.dev_fd = -1; return -1; }
+	if (!drv.ring) {
+		close(drv.dev_fd);
+		drv.dev_fd = -1;
+		physical_disc_acoustic_set_physical(0);
+		return -1;
+	}
 	for (int i = 0; i < RING_SECTORS; i++) drv.ring[i].lba = -1;
 
 	silence_block_probes(active_dev);
@@ -2143,7 +2157,12 @@ void physical_disc_forget_disc(void)
 
 void physical_disc_close()
 {
-	if (drv.dev_fd < 0) return;
+	if (drv.dev_fd < 0) {
+		// Nothing open, but a caller may still have latched the interlock on
+		// a path that never got as far as opening the drive.
+		physical_disc_acoustic_set_physical(0);
+		return;
+	}
 	drv.alive = 0;
 	pthread_join(drv.io_thread, NULL);
 	free(drv.ring);
@@ -2171,4 +2190,7 @@ void physical_disc_close()
 	drv.neighbor_end = 0;
 	for (int w = 0; w < LANE_COUNT; w++) { drv.lane_cursor[w] = 0; drv.lane_active[w] = 0; }
 	active_dev[0] = 0;
+
+	// Drive handed back: the mirror may use it again.
+	physical_disc_acoustic_set_physical(0);
 }

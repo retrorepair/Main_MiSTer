@@ -58,6 +58,11 @@ typedef struct {
 	volatile int no_read;
 	volatile int profile_req;
 
+	// Set while physical_disc owns the drive. The mirror must be completely
+	// silent then -- see physical_disc_acoustic_set_physical().
+	volatile int phys_session;
+	volatile int released;      // worker acknowledges it has let the device go
+
 	// Single producer (whichever core thread is running) / single consumer
 	// (the worker). Indices are free-running; only the difference matters.
 	acu_event_t ring[EVENT_RING];
@@ -222,7 +227,7 @@ static int map_to_mirror(int game_lba)
 
 static int mirror_acquire(void)
 {
-	if (physical_disc_drive_busy()) return -1;
+	if (mir.phys_session || physical_disc_drive_busy()) return -1;
 
 	for (int i = 0; i < 8; i++) {
 		char path[32];
@@ -281,6 +286,15 @@ static int touch(int lba, int blocks)
 {
 	static int read_faults = 0, seek_faults = 0, reopen_faults = 0;
 
+	// Re-checked before every single command, not just once per gesture. A
+	// physical disc session can claim the drive at any point, and one stray
+	// SCSI command issued to the disc the user is actually playing is enough
+	// to stall a load.
+	if (mir.phys_session || physical_disc_drive_busy()) {
+		mirror_release();
+		return -1;
+	}
+
 	if (mir.dev_fd < 0) return -1;
 	if (lba < mir.span_lo) lba = mir.span_lo;
 	if (lba > mir.span_hi) lba = mir.span_hi;
@@ -317,6 +331,15 @@ static int touch(int lba, int blocks)
 }
 
 // ------------------------------------------------------- gesture player ---
+
+// True only when the mirror genuinely owns the device. START STOP UNIT and a
+// speed change are the two commands that can wreck a real disc session
+// outright -- spinning down the disc the user is playing looks exactly like a
+// hung core -- so they are never issued without checking this first.
+static int own_device(void)
+{
+	return mir.dev_fd >= 0 && !mir.phys_session && !physical_disc_drive_busy();
+}
 
 // A gesture carries how long the original mechanism would have taken. The USB
 // drive takes whatever it takes; we issue the ops that make it move the right
@@ -355,7 +378,7 @@ static void play_gesture(const gesture_t *g)
 
 		double slot = g->dur_ms / n;
 		for (int i = 0; i < n; i++) {
-			if (!mir.on || mir.held || mir.dev_fd < 0) break;
+			if (!mir.on || mir.held || mir.phys_session || mir.dev_fd < 0) break;
 			double rf = cd_geom_radius_mm(g->from_lba);
 			double rt = cd_geom_radius_mm(g->lba);
 			int stop_lba = cd_geom_lba_at_radius(rf + (rt - rf) * frac[i]);
@@ -374,7 +397,7 @@ static void play_gesture(const gesture_t *g)
 		if (rate < 1.0) rate = 1.0;
 		int    done = 0;
 		int    want = g->sectors;
-		while (done < want && mir.on && !mir.held && mir.dev_fd >= 0) {
+		while (done < want && mir.on && !mir.held && !mir.phys_session && mir.dev_fd >= 0) {
 			int chunk = ra;
 			if (chunk > want - done) chunk = want - done;
 			double t0 = clock_ms();
@@ -393,13 +416,13 @@ static void play_gesture(const gesture_t *g)
 		break;
 
 	case GEST_SPINUP:
-		if (mir.dev_fd >= 0) mirror_spin(mir.dev_fd, 1);
+		if (own_device()) mirror_spin(mir.dev_fd, 1);
 		touch(target, ra);
 		sleep_ms(g->dur_ms - (clock_ms() - start));
 		break;
 
 	case GEST_SPINDOWN:
-		if (mir.dev_fd >= 0 && !mir.no_read) mirror_spin(mir.dev_fd, 0);
+		if (own_device() && !mir.no_read) mirror_spin(mir.dev_fd, 0);
 		break;
 
 	case GEST_SWEEP: {
@@ -408,7 +431,7 @@ static void play_gesture(const gesture_t *g)
 		double slot = g->dur_ms / 3.0;
 		int pts[3] = { lo, hi, lo };
 		for (int i = 0; i < 3; i++) {
-			if (!mir.on || mir.held || mir.dev_fd < 0) break;
+			if (!mir.on || mir.held || mir.phys_session || mir.dev_fd < 0) break;
 			double t0 = clock_ms();
 			touch(pts[i], ra);
 			sleep_ms(slot - (clock_ms() - t0));
@@ -419,7 +442,7 @@ static void play_gesture(const gesture_t *g)
 	case GEST_PARK:
 		touch(mir.span_lo, ra);
 		sleep_ms(g->dur_ms - (clock_ms() - start));
-		if (mir.dev_fd >= 0 && !mir.no_read) mirror_spin(mir.dev_fd, 0);
+		if (own_device() && !mir.no_read) mirror_spin(mir.dev_fd, 0);
 		break;
 
 	default:
@@ -437,14 +460,17 @@ static void *worker_main(void *arg)
 
 	while (mir.alive) {
 
-		if (!mir.on || mir.held || mir.disabled_perm) {
+		if (!mir.on || mir.held || mir.disabled_perm || mir.phys_session) {
 			mirror_release();
 			// Throw away anything the cores queued while we were parked, so
 			// we do not wake up and replay a minute of stale activity.
 			mir.ring_head = mir.ring_tail;
-			sleep_ms(150);
+			// Tell whoever is waiting that the device is theirs.
+			mir.released = 1;
+			sleep_ms(mir.phys_session ? 50 : 150);
 			continue;
 		}
+		mir.released = 0;
 
 		if (mir.profile_req != applied_profile) {
 			applied_profile = mir.profile_req;
@@ -526,6 +552,36 @@ void physical_disc_acoustic_config(int enabled)
 	}
 }
 
+void physical_disc_acoustic_set_physical(int phys)
+{
+	if (!phys) {
+		mir.phys_session = 0;
+		return;
+	}
+
+	if (mir.phys_session) return;
+	mir.phys_session = 1;
+
+	// Drop anything the cores already queued: it describes the real disc the
+	// drive is about to serve for itself, and replaying it later would be
+	// nonsense.
+	mir.ring_head = mir.ring_tail;
+
+	if (!mir.alive || !mir.on) return;
+
+	// Wait for the worker to confirm it has closed the device before the
+	// caller opens it. The worker re-checks phys_session before every command,
+	// so this is short; the bound is here only so a wedged SCSI command can
+	// never hold up a disc mount.
+	double start = clock_ms();
+	while (!mir.released && clock_ms() - start < 1500.0) {
+		struct timespec ts = { 0, 5 * 1000 * 1000 };
+		nanosleep(&ts, NULL);
+	}
+	if (!mir.released)
+		printf("physical_disc_acoustic: mirror did not release the drive in time\n");
+}
+
 void physical_disc_acoustic_set_profile(pd_acoustic_profile_t profile)
 {
 	// PHYSICAL_DISC_ACOUSTIC_PROFILE in MiSTer.ini pins the imitated drive;
@@ -542,7 +598,10 @@ void physical_disc_acoustic_set_profile(pd_acoustic_profile_t profile)
 
 void physical_disc_acoustic_event(pd_acoustic_event_t ev, int lba, int count)
 {
-	if (!mir.on || mir.held || mir.disabled_perm) return;
+	// phys_session: the real drive is serving a real disc and is already
+	// making the right noise by itself. Nothing to mirror, and nothing may
+	// touch the device.
+	if (!mir.on || mir.held || mir.disabled_perm || mir.phys_session) return;
 
 	unsigned tail = mir.ring_tail;
 	if (tail - mir.ring_head >= EVENT_RING - 1) {

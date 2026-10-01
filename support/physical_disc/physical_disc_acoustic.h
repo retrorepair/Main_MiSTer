@@ -38,6 +38,13 @@ typedef enum {
 
 void physical_disc_acoustic_config(int enabled);
 
+// Hard interlock. While a physical disc session owns the drive the mirror must
+// not touch it at all: that drive is holding the user's actual game disc, and
+// its noise is already genuine. Called with 1 when physical_disc takes the
+// device and 0 when it gives it back. Setting it to 1 blocks briefly until the
+// mirror has confirmed it let go, so the caller can then open the drive safely.
+void physical_disc_acoustic_set_physical(int phys);
+
 // Pick the drive being imitated. Called when a core mounts a disc; AUTO leaves
 // whatever the last core set.
 void physical_disc_acoustic_set_profile(pd_acoustic_profile_t profile);
