@@ -89,16 +89,52 @@ double acu_model_seek_ms(const acu_drive_t *d, int from_lba, int to_lba)
 	return d->short_seek_ms + (d->full_stroke_ms - d->short_seek_ms) * f + rot_ms;
 }
 
+// "Where the head is now" -- only the newest of these carries any information,
+// so they are the ones to throw away under pressure. Everything else is an
+// event with its own sound and duration.
+static int gesture_is_update(gesture_kind_t k)
+{
+	return k == GEST_STREAM || k == GEST_JUMP || k == GEST_HOLD;
+}
+
 static void emit(acu_model_t *m, const gesture_t *g)
 {
-	int next = (m->out_tail + 1) & 7;
-	if (next == m->out_head) {
-		// Queue full: drop the oldest. The drive can only be in one place, so
-		// a stale gesture is worth less than the newest one.
-		m->out_head = (m->out_head + 1) & 7;
+	if (((m->out_tail + 1) & 7) == m->out_head) {
+		// Full. Drop the oldest DISCARDABLE gesture, not simply the oldest.
+		//
+		// Dropping the oldest outright cost the audio lock-on: while the player
+		// spent two and a half seconds on a cross-disc traverse, the model
+		// emitted the LOCK and then a run of stream updates behind it, and the
+		// LOCK -- being oldest -- was the first thing thrown out. It never
+		// reached the player at all, which is why it could not be heard and
+		// could not be found in the player either.
+		//
+		// Third time this class of mistake has bitten: a burst of moves, then
+		// the lock-on in the player, now the lock-on here. Anything that is not
+		// positional is kept.
+		int found = -1;
+		for (int i = m->out_head; i != m->out_tail; i = (i + 1) & 7) {
+			if (gesture_is_update(m->out[i].kind)) { found = i; break; }
+		}
+
+		if (found < 0) {
+			// Every queued gesture is a real event; nothing better to do than
+			// lose the oldest.
+			m->out_head = (m->out_head + 1) & 7;
+		}
+		else {
+			int j = found, nxt = (found + 1) & 7;
+			while (nxt != m->out_tail) {
+				m->out[j] = m->out[nxt];
+				j   = nxt;
+				nxt = (nxt + 1) & 7;
+			}
+			m->out_tail = j;
+		}
 	}
+
 	m->out[m->out_tail] = *g;
-	m->out_tail = next;
+	m->out_tail = (m->out_tail + 1) & 7;
 }
 
 int acu_model_poll(acu_model_t *m, gesture_t *out)
@@ -153,8 +189,9 @@ static void emit_move(acu_model_t *m, int from, int to)
 	}
 
 	emit(m, &g);
-	m->head_lba = to;
-	m->holding  = 0;
+	m->head_lba   = to;
+	m->holding    = 0;
+	m->just_moved = 1;
 }
 
 static void emit_stream(acu_model_t *m, double now_ms, int lba, double mult, double rate, int audio)
@@ -296,21 +333,28 @@ void acu_model_event(acu_model_t *m, double now_ms, pd_acoustic_event_t ev, int 
 			// from: a filesystem walk is dozens of these, and the old code
 			// could not see any of them.
 			emit_move(m, m->head_lba, lba);
-
-			// Arriving at an audio track is not the same as playing it. The
-			// drive settles, acquires the subcode and spin-locks first, and the
-			// disc turns several times before any sound comes out. Six
-			// revolutions on a Mega CD, which at 1x is well over a second out
-			// near the rim -- long enough that leaving it out is conspicuous.
-			if (ev == PD_ACU_PLAY && d->lock_revs > 0) {
-				double rev_ms = cd_geom_sectors_per_rev(lba) / 75.0 * 1000.0 / mult;
-				simple(m, GEST_LOCK, lba, d->lock_revs * rev_ms, mult);
-			}
-
 			m->streaming         = 0;
 			m->stream_anchor_lba = lba;
 			m->stream_anchor_ms  = now_ms;
 		}
+
+		// Arriving at an audio track is not the same as playing it. The drive
+		// settles, acquires the subcode and spin-locks first, and the disc turns
+		// several times before any sound comes out -- six revolutions on a Mega
+		// CD, well over a second out near the rim.
+		//
+		// Keyed on having just repositioned, NOT on the read being
+		// discontiguous. A Mega CD issues an explicit seek before it plays, so
+		// by the time the first audio sector arrives the model has already moved
+		// the head and the read looks perfectly contiguous. Checking
+		// contiguity alone meant the lock-on never fired on the one console
+		// whose lock-on is most obvious, which is why a track change was
+		// missing seconds of it.
+		if (ev == PD_ACU_PLAY && m->just_moved && d->lock_revs > 0) {
+			double rev_ms = cd_geom_sectors_per_rev(lba) / 75.0 * 1000.0 / mult;
+			simple(m, GEST_LOCK, lba, d->lock_revs * rev_ms, mult);
+		}
+		m->just_moved = 0;
 
 		// Never let a re-read drag the modelled head backwards.
 		if (lba + count > m->head_lba || !contiguous) m->head_lba = lba + count;

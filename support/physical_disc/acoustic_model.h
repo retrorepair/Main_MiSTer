@@ -68,6 +68,7 @@ typedef struct {
 	double last_emit_ms;
 	int    pending_stream;
 	int    holding;
+	int    just_moved;        // repositioned and not yet started reading there
 
 	gesture_t out[8];
 	int    out_head, out_tail;

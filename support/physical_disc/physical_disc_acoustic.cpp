@@ -791,7 +791,15 @@ static void grime_grind(int from_lba, int to_lba, double total_ms)
 	// So make the traverses FEWER and LONGER, not more and shorter. A worn
 	// mechanism overshoots and has to come back, and each of those passes is a
 	// full continuous grind in its own right.
-	int passes = 1 + grime_level() / 4;             // 1..3 extra traverses
+	// A long move earns more passes than a short one. A near-full-stroke
+	// traverse is about 700 ms on a period drive, and a real Mega CD spends
+	// roughly three seconds hunting out an audio track -- so crossing the disc
+	// takes several goes, while a short hop does not. Scaling only with the
+	// grime level made a 20 mm move and a 1 mm move take the same time, which
+	// is why starting a track was not the event it should have been.
+	int passes = 1 + grime_level() / 4;             // 1..3 from wear alone
+	if (dist > 15.0)     passes += 2;               // crossing the disc
+	else if (dist > 5.0) passes += 1;
 	int surge  = grime_level() >= 8 && !mir.no_read;
 
 	for (int i = 0; i < passes; i++) {
@@ -1314,6 +1322,18 @@ static void *worker_main(void *arg)
 		while (mir.ring_head != mir.ring_tail && drained < 64) {
 			acu_event_t e = mir.ring[mir.ring_head & (EVENT_RING - 1)];
 			mir.ring_head++;
+			// Log what the cores actually report, not what they were assumed
+			// to. Chasing a missing lock-on through the model was guesswork
+			// without this.
+			static const char *evname[] = { "SEEK", "READ", "PLAY", "SCAN",
+			                                "PAUSE", "STOP", "TOC", "SPINUP",
+			                                "TRAY_OPEN", "TRAY_CLOSE" };
+			if (e.ev != PD_ACU_READ && e.ev != PD_ACU_PLAY)
+				acu_log("  ev %-10s lba %7d cnt %d\n",
+				        (e.ev <= PD_ACU_TRAY_CLOSE) ? evname[e.ev] : "?", e.lba, e.count);
+			else if (!(drained % 64))
+				acu_log("  ev %-10s lba %7d cnt %d (sampled)\n",
+				        (e.ev <= PD_ACU_TRAY_CLOSE) ? evname[e.ev] : "?", e.lba, e.count);
 			acu_model_event(&model, e.at_ms, e.ev, e.lba, e.count);
 			drained++;
 		}
@@ -1343,21 +1363,29 @@ static void *worker_main(void *arg)
 		// order. Moves are rare next to streams -- single figures against
 		// hundreds -- so keeping all of them costs almost nothing.
 		{
-			#define IS_MOVE(k) ((k) == GEST_SLEW || (k) == GEST_STEP || \
-			                    (k) == GEST_SWEEP || (k) == GEST_SPINUP || \
-			                    (k) == GEST_SPINDOWN || (k) == GEST_PARK)
+			// Listing what is SAFE TO DISCARD, not what is worth keeping.
+			//
+			// The other way round has now cost two separate bugs: first the
+			// move burst of a scene transition, then the audio lock-on, both
+			// silently eaten because they were not in a list of exceptions. A
+			// gesture that is merely "where the head is now" is discardable;
+			// everything else is an event with its own sound and duration.
+			// Written this way a gesture added later defaults to being kept,
+			// which is the direction that fails safely.
+			#define IS_UPDATE(k) ((k) == GEST_STREAM || (k) == GEST_JUMP || \
+			                      (k) == GEST_HOLD)
 
 			gesture_t next;
 			int collapsed = 0;
 
-			if (!IS_MOVE(g.kind)) {
-				// Scan forward for a move. If one is queued it takes priority
-				// over any number of stale position updates; if not, the newest
-				// update is the only one that means anything.
+			if (IS_UPDATE(g.kind)) {
+				// Scan forward for a real event. If one is queued it takes
+				// priority over any number of stale position updates; if not,
+				// the newest update is the only one that means anything.
 				while (acu_model_poll(&model, &next)) {
 					collapsed++;
 					g = next;
-					if (IS_MOVE(g.kind)) break;
+					if (!IS_UPDATE(g.kind)) break;
 				}
 			}
 			if (collapsed)
@@ -1470,6 +1498,29 @@ void physical_disc_acoustic_event(pd_acoustic_event_t ev, int lba, int count)
 	// making the right noise by itself. Nothing to mirror, and nothing may
 	// touch the device.
 	if (!mir.on || mir.held || mir.disabled_perm || mir.phys_session) return;
+
+	// Reject nonsense and repetition at the door.
+	//
+	// A CDD command handler runs on every command the core issues, and the BIOS
+	// re-issues PLAY and SEEK constantly while it polls -- often with MSF values
+	// below the 150-sector pregap, which come out as negative LBAs. Observed on
+	// a Mega CD: a steady stream of seeks to -5, -2 and -1 among the real ones.
+	//
+	// Passed through, the model clamps them to zero and believes the head is
+	// repeatedly slamming to the hub. That wrecks head tracking, swamps the
+	// gesture queue so real movement is dropped, and clears the just-moved state
+	// that the audio lock-on depends on. None of them are head movements.
+	if (lba < 0) {
+		if (ev == PD_ACU_SEEK || ev == PD_ACU_SCAN) return;
+		lba = 0;
+	}
+
+	// The same seek re-issued every frame is one seek.
+	static int last_seek_lba = INT_MIN;
+	if (ev == PD_ACU_SEEK) {
+		if (lba == last_seek_lba) return;
+		last_seek_lba = lba;
+	}
 
 	unsigned tail = mir.ring_tail;
 	if (tail - mir.ring_head >= EVENT_RING - 1) {
