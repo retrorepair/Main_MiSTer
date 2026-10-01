@@ -657,6 +657,67 @@ static int own_device(void)
 	return mir.dev_fd >= 0 && !mir.phys_session && !physical_disc_drive_busy();
 }
 
+// ------------------------------------------------------------- grime -------
+//
+// PHYSICAL_DISC_ACOUSTIC_GRIME, 0..10, 0 = a factory-fresh mechanism.
+//
+// The acoustic model deliberately describes a HEALTHY drive reading a CLEAN
+// disc. Real consoles by now are neither: the sled is dry, the lens is hazy,
+// the disc is scuffed, and the servo spends its life losing lock and
+// recovering. That recovery is most of what an old console actually sounds
+// like -- the stutter and hunt, not the smooth parts.
+//
+// This is the one place in here that invents activity the original would not
+// have had on a good day, which is why it is opt-in and lives in the player
+// rather than the model. Everything it adds is still real mechanism motion: a
+// hunt is an actual sled move, not a sample.
+static unsigned grime_rng(void)
+{
+	static unsigned s = 0x1234567u;
+	s ^= s << 13; s ^= s >> 17; s ^= s << 5;
+	return s;
+}
+
+static int grime_level(void)
+{
+	int g = cfg.physical_disc_acoustic_grime;
+	if (g < 0)  g = 0;
+	if (g > 10) g = 10;
+	return g;
+}
+
+// Fires with a probability that rises with the grime level.
+static int grime_hits(int per_ten_percent)
+{
+	int g = grime_level();
+	if (!g) return 0;
+	return (int)(grime_rng() % 100) < (g * per_ten_percent);
+}
+
+// A tracking hunt: the servo slips back, reacquires, and catches up. One short
+// sled twitch each way, which is audible on a tired mechanism and is the
+// signature of a disc the drive is struggling to follow.
+static void grime_hunt(int lba, int reach)
+{
+	if (mir.dev_fd < 0 || mir.phys_session) return;
+
+	int back = lba - reach;
+	if (back < mir.span_lo) back = mir.span_lo;
+
+	if (mir.play_mode) {
+		int blk = mir.span_hi - back; if (blk < 1) blk = 1;
+		mirror_play(mir.dev_fd, back, blk);
+		sleep_ms(18 + (grime_rng() % 40));
+		blk = mir.span_hi - lba; if (blk < 1) blk = 1;
+		mirror_play(mir.dev_fd, lba, blk);
+	}
+	else {
+		touch(back, 2);
+		sleep_ms(18 + (grime_rng() % 40));
+		touch(lba, 2);
+	}
+}
+
 // A gesture carries how long the original mechanism would have taken. The USB
 // drive takes whatever it takes; we issue the ops that make it move the right
 // distance and then hold the remainder of the slot so the rhythm is right.
@@ -779,6 +840,9 @@ static void play_gesture(const gesture_t *g)
 					int blk = mir.span_hi - at; if (blk < 1) blk = 1;
 					double t0 = clock_ms();
 					mirror_play(mir.dev_fd, at, blk);
+					// A scuffed data track is where a tired servo loses lock
+					// most often, and the re-read stutter is the sound of it.
+					if (grime_hits(7)) grime_hunt(at, 120 + (int)(grime_rng() % 900));
 					sleep_ms(slot - (clock_ms() - t0));
 				}
 			}
@@ -805,6 +869,10 @@ static void play_gesture(const gesture_t *g)
 				mirror_play(mir.dev_fd, stop_lba, blk);
 				sleep_ms(slot - (clock_ms() - t0));
 			}
+			// A dry sled overshoots and has to come back. On the last stage of
+			// a long seek that correction is very audible, and it is why an old
+			// console takes two goes to settle before it starts reading.
+			if (grime_hits(9)) grime_hunt(target, 400 + (int)(grime_rng() % 2600));
 			break;
 		}
 
@@ -817,6 +885,10 @@ static void play_gesture(const gesture_t *g)
 		case GEST_SPINUP:
 			mirror_spin(mir.dev_fd, 1);
 			mirror_play(mir.dev_fd, target, tail);
+			// A hazy lens takes several goes to focus. Everyone who owned one
+			// of these knows the sound of a console thinking about it.
+			for (int i = 0; i < grime_level() / 3 + (grime_hits(5) ? 1 : 0); i++)
+				grime_hunt(target, 800 + (int)(grime_rng() % 4000));
 			sleep_ms(g->dur_ms - (clock_ms() - start));
 			break;
 

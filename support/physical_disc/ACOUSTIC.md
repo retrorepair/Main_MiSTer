@@ -193,3 +193,43 @@ read-based modes remain as fallbacks for a data-only disc.
 With a full stroke and a genuine 1x spindle, `PHYSICAL_DISC_ACOUSTIC_GAIN` has
 much less work to do; try 1 (faithful) first and only raise it if the
 file-system hops are still too small to hear.
+
+## Grime
+
+`PHYSICAL_DISC_ACOUSTIC_GRIME`, 0..10, default 0.
+
+The model deliberately describes a **healthy** drive reading a **clean** disc.
+Real consoles are neither by now: the sled is dry, the lens is hazy, the disc is
+scuffed, and the servo spends its life losing lock and recovering. That recovery
+is most of what an old console actually sounds like — the stutter and the hunt,
+not the smooth parts.
+
+Grime adds that back, scaled by level:
+
+| where | what a worn mechanism does |
+|-------|-----------------------------|
+| data stream | servo slips on a scuffed track and re-reads |
+| end of a long seek | dry sled overshoots and corrects |
+| spin-up | hazy lens takes several goes to focus |
+
+This is **the one part of the engine that invents activity the original would
+not have had on a good day**, which is why it is opt-in and why it lives in the
+player rather than in the model — the model stays an honest description of a
+healthy mechanism. Everything grime adds is still real mechanism motion: a hunt
+is an actual sled move, not a sample.
+
+## Drive choice, measured
+
+Three drives, same music CD, same 120000-sector seek:
+
+| drive | PLAY AUDIO | seek | verdict |
+|-------|-----------|------|---------|
+| modern slot-load | 1.002x | 288 ms | right speed, far too quiet |
+| Mitsumi FX120T (~1997, 12x) | 0.998x | 625 ms | period mechanism, audible |
+| IDE-CD R/RW 8x4x32 (early 2000s) | 1.001x | 1385 ms | slowest sled of the three |
+
+All three hit a true 1x under `PLAY AUDIO`, so the differences are purely
+mechanical. The slot-loader is engineered to be silent and no software setting
+changes that; an older tray drive is the single biggest improvement available.
+The CD-RW's sled is slower than a real Mega CD's, which makes its seeks the most
+prominent of the three.
