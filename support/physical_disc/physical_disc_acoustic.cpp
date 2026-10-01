@@ -752,38 +752,44 @@ static void grime_grind(int from_lba, int to_lba, double total_ms)
 	// So take the smaller of the two counts and let the traverse finish early
 	// if the distance simply cannot fill the time. A short seek being short is
 	// correct anyway.
-	// The steps are SEEK(10), not PLAY. Measured on the drive here, a 70-step
-	// staircase costs 42 ms per step with SEEK and 200 ms per step with PLAY,
-	// because PLAY has to re-establish the audio servo every time. At 200 ms
-	// apart the sled stops between every step and the result is a row of
-	// clunks -- which is what the PLAY version of this actually sounded like.
-	// SEEK is the bare positioning command and its own latency paces the
-	// staircase at about the right cadence with no sleeping required.
-	#define GRIND_STEP_MIN_MM  0.06
-	#define GRIND_SEEK_MS      42.0
+	(void)total_ms;
 
-	int n_by_step = (int)(dist / GRIND_STEP_MIN_MM);
-	int n         = (int)(total_ms / GRIND_SEEK_MS);
-	if (n > n_by_step) n = n_by_step;
-	if (n < 2)   n = 2;
-	if (n > 240) n = 240;
+	// A single long seek IS the grind, and trying to synthesise one out of
+	// small steps was simply the wrong idea.
+	//
+	// Every SCSI positioning command is a move-and-settle: the firmware runs
+	// the sled to the address and stops it. Issuing them back to back does not
+	// produce continuous motion, it produces one settle after another -- at
+	// SEEK's 42 ms that is a 24 Hz buzz, and at PLAY's 200 ms a row of clunks.
+	// Two rounds of judder came from chopping up the one thing that actually
+	// moves the sled smoothly: the drive's own coordinated traverse, measured
+	// at 1385 ms unbroken for 20 mm on the drive here.
+	//
+	// So make the traverses FEWER and LONGER, not more and shorter. A worn
+	// mechanism overshoots and has to come back, and each of those passes is a
+	// full continuous grind in its own right.
+	int passes = 1 + grime_level() / 4;             // 1..3 extra traverses
+	int surge  = grime_level() >= 8 && !mir.no_read;
 
-	int surge = grime_level() >= 8 && !mir.no_read;
-
-	for (int i = 1; i <= n; i++) {
+	for (int i = 0; i < passes; i++) {
 		if (!mir.on || mir.held || mir.phys_session || mir.dev_fd < 0) break;
-		int at = media_lba_at_radius(r0 + span * ((double)i / n));
 
-		// No pacing sleep: back to back is the point. The command's own settle
-		// time is the cadence, and anything added here opens a gap.
+		// Overshoot past the target, alternating side and shrinking each time,
+		// so it closes in rather than flailing.
+		double over = (dist * 0.35 + 2.0) / (i + 1);
+		if (i & 1) over = -over;
+		int at = lba_offset_mm(to_lba, span > 0 ? over : -over);
+
 		mirror_seek(mir.dev_fd, at);
 
-		// Spindle surge. A raw read spins the drive up hard; letting it fall
-		// back gives the rising and falling whine of a mechanism labouring
-		// rather than a level tone. Failure is fine -- we want the spin-up, not
-		// the bytes.
-		if (surge && !(grime_rng() % 6)) mirror_read_raw(mir.dev_fd, at, 24, 700);
+		// Spindle surge: a raw read spins the drive up hard, and dropping back
+		// lets it fall. Failure is fine -- we want the spin-up, not the bytes.
+		if (surge) mirror_read_raw(mir.dev_fd, at, 24, 700);
+
+		sleep_ms(40 + (grime_rng() % 90));          // let it settle audibly
 	}
+
+	mirror_seek(mir.dev_fd, to_lba);                // finally arrives
 
 	// SEEK stops audio playback outright (verified: PLAYING -> DONE), so hand
 	// the spindle back to a true 1x before the mirror carries on.
@@ -929,7 +935,7 @@ static void play_gesture(const gesture_t *g)
 				// A scratched disc makes a CD player hunt and skip mid-track.
 				// Gentler than on a data read, because the drive is not also
 				// fighting to get the sector right.
-				if (!(grime_rng() % 4)) grime_hunt(target, 0.6, 0);
+				if (grime_level() >= 9 && !(grime_rng() % 16)) grime_hunt(target, 1.2, 0);
 				sleep_ms(g->dur_ms - (clock_ms() - start));
 			}
 			else {
@@ -955,7 +961,10 @@ static void play_gesture(const gesture_t *g)
 					// Seasoning only. This read-retry stutter was dominating
 					// and reading as "poor disc" rather than "old mechanism";
 					// the seeks are what should carry the character.
-					if (!(grime_rng() % 3)) grime_hunt(at, 0.7, 0);
+					// Near-silent now by design. Micro-hunts were adding a
+					// constant buzz that muddied the seeks, and a buzz is not
+					// what a worn drive sounds like anyway.
+					if (grime_level() >= 9 && !(grime_rng() % 12)) grime_hunt(at, 1.5, 0);
 					sleep_ms(slot - (clock_ms() - t0));
 				}
 			}
@@ -978,7 +987,7 @@ static void play_gesture(const gesture_t *g)
 				grime_grind(from, target, drag);
 				// Then overshoot and come back, which is why an old console
 				// takes two goes to settle before it starts reading.
-				grime_hunt(target, 3.0, 1);
+				// the grind already overshoots and returns; no extra fidget
 			}
 			else {
 				static const double two[]   = { 0.85, 1.0 };
@@ -1005,7 +1014,7 @@ static void play_gesture(const gesture_t *g)
 			// to pull itself back, which is the idle fidgeting you hear from a
 			// console sitting on a menu.
 			mirror_pause(mir.dev_fd, 0);
-			if (!(grime_rng() % 3)) grime_hunt(from, 0.8, 0);
+			if (grime_level() >= 7 && !(grime_rng() % 6)) grime_hunt(from, 2.0, 0);
 			sleep_ms(g->dur_ms);
 			break;
 
@@ -1029,6 +1038,24 @@ static void play_gesture(const gesture_t *g)
 			// grinding out in full -- it is the sound of the console waking up.
 			int gl = grime_level();
 			if (gl) {
+				// Wind the spindle right down and back up before the sweep. A
+				// console that has been sitting does not come straight up to
+				// speed -- it drops, catches, and hauls itself back, and that
+				// is the first thing you hear when one is switched on. Only
+				// worth doing here: it costs seconds, which is fine once at
+				// boot and intolerable anywhere else.
+				if (gl >= 5) {
+					mirror_stop_play(mir.dev_fd);
+					if (own_device()) mirror_spin(mir.dev_fd, 0);
+					sleep_ms(500);
+					sleep_ms(500);               // spin-down is not instant
+					if (own_device()) mirror_spin(mir.dev_fd, 1);
+					sleep_ms(500);
+					sleep_ms(500);
+					grime_resume(mir.span_lo);
+				}
+				// Full stroke out and back: the longest continuous travel the
+				// mechanism ever makes.
 				double leg = g->dur_ms * (1.0 + gl * 0.30) / 2.0;
 				grime_grind(mir.span_lo, mir.span_hi, leg);
 				grime_grind(mir.span_hi, mir.span_lo, leg);
