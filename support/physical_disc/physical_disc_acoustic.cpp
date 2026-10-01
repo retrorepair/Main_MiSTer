@@ -1043,7 +1043,12 @@ void physical_disc_acoustic_config(int enabled)
 	if (mir.on && !mir.alive) {
 		mir.dev_fd      = -1;
 		mir.held        = 0;
-		mir.profile_req = PD_ACU_PROFILE_AUTO;
+		// A pinned profile from MiSTer.ini has to apply from the start, not
+		// only once some core gets around to mounting a disc -- otherwise the
+		// drive is set up for the wrong mechanism until then.
+		int forced = cfg.physical_disc_acoustic_profile;
+		mir.profile_req = (forced > PD_ACU_PROFILE_AUTO && forced < PD_ACU_PROFILE_COUNT)
+		                ? forced : PD_ACU_PROFILE_AUTO;
 		mir.media_full  = MEDIA_FULL_CD;
 		acu_model_init(&model, PD_ACU_PROFILE_AUTO);
 		mir.alive = 1;
