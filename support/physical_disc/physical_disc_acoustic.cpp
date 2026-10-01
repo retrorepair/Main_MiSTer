@@ -750,15 +750,38 @@ static void play_gesture(const gesture_t *g)
 			break;
 
 		case GEST_STREAM: {
-			// Only re-issue if the drive has drifted away from where the model
-			// thinks the head should be. A 1x profile needs almost no nudging;
-			// a 2x one needs a small jump now and then, because audio playback
-			// is 1x and cannot be made faster.
-			int pos = 0, playing = 0;
-			if (mirror_subq(mir.dev_fd, &pos, &playing)) { playing = 0; pos = -1; }
-			int drift = (pos < 0) ? INT_MAX : (pos > target ? pos - target : target - pos);
-			if (!playing || drift > 400) mirror_play(mir.dev_fd, target, tail);
-			sleep_ms(g->dur_ms - (clock_ms() - start));
+			if (g->audio) {
+				// Red Book audio: the original deck tracked this smoothly and
+				// quietly, and so does this one. Only step in if the drive has
+				// drifted from where the model says the head should be.
+				int pos = 0, playing = 0;
+				if (mirror_subq(mir.dev_fd, &pos, &playing)) { playing = 0; pos = -1; }
+				int drift = (pos < 0) ? INT_MAX
+				          : (pos > target ? pos - target : target - pos);
+				if (!playing || drift > 400) mirror_play(mir.dev_fd, target, tail);
+				sleep_ms(g->dur_ms - (clock_ms() - start));
+			}
+			else {
+				// A data read is not smooth tracking. The original mechanism
+				// was working hard here -- seeking back over a sector it had to
+				// retry, correcting, reacquiring -- and that busy servo is the
+				// sound of a console LOADING, which is the sound anyone
+				// actually recognises. Re-aiming the head a few times across
+				// the gesture reproduces that; letting it glide does not.
+				int n = 3;
+				double slot = g->dur_ms / n;
+				int span = (int)(g->rate_sectors_s * g->dur_ms / 1000.0 / n);
+				if (span < 1) span = 1;
+				for (int i = 0; i < n; i++) {
+					if (!mir.on || mir.held || mir.phys_session || mir.dev_fd < 0) break;
+					int at  = target + i * span;
+					if (at > mir.span_hi) at = mir.span_hi;
+					int blk = mir.span_hi - at; if (blk < 1) blk = 1;
+					double t0 = clock_ms();
+					mirror_play(mir.dev_fd, at, blk);
+					sleep_ms(slot - (clock_ms() - t0));
+				}
+			}
 			break;
 		}
 

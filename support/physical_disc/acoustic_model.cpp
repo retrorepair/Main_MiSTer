@@ -150,7 +150,7 @@ static void emit_move(acu_model_t *m, int from, int to)
 	m->holding  = 0;
 }
 
-static void emit_stream(acu_model_t *m, double now_ms, int lba, double mult, double rate)
+static void emit_stream(acu_model_t *m, double now_ms, int lba, double mult, double rate, int audio)
 {
 	gesture_t g;
 	memset(&g, 0, sizeof(g));
@@ -159,6 +159,7 @@ static void emit_stream(acu_model_t *m, double now_ms, int lba, double mult, dou
 	g.lba            = lba;
 	g.rpm            = cd_geom_rpm(lba, mult);
 	g.rate_sectors_s = rate;
+	g.audio          = audio;
 	g.sectors        = (int)(rate * 0.25);   // re-evaluated four times a second
 	if (g.sectors < 1) g.sectors = 1;
 	g.dur_ms         = g.sectors * 1000.0 / (rate > 1.0 ? rate : 1.0);
@@ -303,7 +304,7 @@ void acu_model_event(acu_model_t *m, double now_ms, pd_acoustic_event_t ev, int 
 			m->stream_anchor_lba = lba;
 			m->stream_anchor_ms  = now_ms;
 			m->stream_rate       = 75.0 * mult;
-			emit_stream(m, now_ms, lba, mult, m->stream_rate);
+			emit_stream(m, now_ms, lba, mult, m->stream_rate, ev == PD_ACU_PLAY);
 		}
 		else {
 			double dt = now_ms - m->stream_anchor_ms;
@@ -321,7 +322,7 @@ void acu_model_event(acu_model_t *m, double now_ms, pd_acoustic_event_t ev, int 
 				m->stream_anchor_ms  = now_ms;
 			}
 			if (now_ms - m->last_emit_ms >= 150.0)
-				emit_stream(m, now_ms, m->head_lba, mult, m->stream_rate);
+				emit_stream(m, now_ms, m->head_lba, mult, m->stream_rate, ev == PD_ACU_PLAY);
 		}
 		break;
 	}

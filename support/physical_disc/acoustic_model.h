@@ -33,6 +33,7 @@ typedef struct {
 	int    stages;          // sled sub-moves for a slew (coarse then fine)
 	double rate_sectors_s;  // for STREAM: how fast the head creeps
 	int    sectors;         // for STREAM: how far it runs before re-evaluating
+	int    audio;           // STREAM is Red Book audio, not a data read
 } gesture_t;
 
 typedef struct {
