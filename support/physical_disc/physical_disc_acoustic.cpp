@@ -499,6 +499,16 @@ static void *worker_main(void *arg)
 
 void physical_disc_acoustic_config(int enabled)
 {
+	// mir is static, so dev_fd starts at 0 -- a perfectly valid descriptor
+	// (stdin). Nothing reaches it before the worker exists today, but close(0)
+	// is not a mistake worth leaving one refactor away.
+	static int inited = 0;
+	if (!inited) {
+		inited         = 1;
+		mir.dev_fd     = -1;
+		mir.media_full = MEDIA_FULL_CD;
+	}
+
 	mir.on = enabled ? 1 : 0;
 	if (mir.on && !mir.alive) {
 		mir.dev_fd      = -1;
