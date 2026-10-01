@@ -86,6 +86,9 @@ typedef struct {
 	volatile int alive;
 	volatile int disabled_perm;
 	volatile int no_read;
+	// Alternates the data-read resync between "back a little" and "return",
+	// one real sled move per gesture, so a load is continuously audible.
+	unsigned read_phase;
 	volatile int spun;        // do we believe the spindle is actually turning
 	volatile int play_mode;   // drive runs the mechanism via PLAY AUDIO at true 1x
 	volatile int shrinks;     // reactive span pull-ins, reset on each acquire
@@ -382,6 +385,28 @@ static int mirror_subq(int fd, int *lba_out, int *playing_out)
 	return 0;
 }
 
+// Move the head and WAIT for it to arrive.
+//
+// SEEK(10) on this drive is fire-and-forget: measured at 1.0 ms for every
+// distance from 0.5 mm to 32 mm, which no sled can do. The command is queued and
+// returns at once, so a staircase of seeks issued back to back collapses -- each
+// target overwrites the one before it and the drive performs a single move. That
+// is why no amount of reshaping the staircase has ever been audible: there has
+// only ever been one move.
+//
+// READ SUB-CHANNEL serialises behind the pending move, so SEEK followed by a
+// sub-channel read costs the real mechanical time -- measured 150 ms fixed plus
+// about 16 ms per millimetre (310 ms over 0.5 mm, 260 over 8, 373 over 16, 673
+// over 32), and the head lands exactly on target. Anything that is meant to be
+// heard as a separate sled movement has to go through here and pay that.
+static int mirror_seek_sync(int fd, int lba)
+{
+	int r = mirror_seek(fd, lba);
+	int pos = 0, playing = 0;
+	mirror_subq(fd, &pos, &playing);
+	return r;
+}
+
 static void mirror_spin(int fd, int start)
 {
 	uint8_t cdb[6] = { 0 };
@@ -594,7 +619,7 @@ static int touch(int lba, int blocks)
 	// is usable surface. Drop to READ(10) if the drive has no READ CD, and to
 	// seek-only if it will not read at all.
 	int r;
-	if (mir.no_read)        r = mirror_seek(mir.dev_fd, lba);
+	if (mir.no_read)        r = mirror_seek_sync(mir.dev_fd, lba);
 	else if (mir.raw_read)  r = mirror_read_raw(mir.dev_fd, lba, blocks, CMD_TIMEOUT_MS);
 	else                    r = mirror_read(mir.dev_fd, lba, blocks, CMD_TIMEOUT_MS);
 
@@ -751,13 +776,16 @@ static int lba_offset_mm(int lba, double delta_mm)
 	return out;
 }
 
-// Move the head and nothing else. SEEK(10) costs about 42 ms against PLAY's
-// 200 ms, measured, because PLAY re-establishes the audio servo every time. For
-// anything meant to sound quick -- a stutter, a hunt, a staircase step -- PLAY
-// is simply too slow a primitive and turns it into a series of clunks.
+// Move the head and nothing else. A bare SEEK(10) looked like the cheap
+// primitive for this -- 42 ms against PLAY's 200 ms -- but that 42 ms was the
+// drive queueing the command and returning, not moving: re-measured, a bare SEEK
+// costs 1.0 ms over any distance from 0.5 mm to 32 mm. Everything built on it
+// (the hunts, the stutters, the staircase) was therefore inaudible, and the one
+// move that did happen was whatever the last target had been. Synchronised, this
+// costs 150 ms + 16 ms/mm and the sled actually goes there.
 static void grime_aim(int lba)
 {
-	if (mir.play_mode) mirror_seek(mir.dev_fd, lba);
+	if (mir.play_mode) mirror_seek_sync(mir.dev_fd, lba);
 	else               touch(lba, 2);
 }
 
@@ -799,15 +827,23 @@ static void grime_resume(int lba)
 // the target, and the duration comes out right.
 // Fitted to the two measurements that matter for long moves: 261 ms at 60000
 // sectors and 693 ms at 280000.
-#define SEEK_FIXED_MS        143.0
-#define SEEK_PER_SECTOR_MS   0.00196
-#define DRIVE_MIN_SEEK_MS    200.0
+// Re-measured against a SYNCHRONISED seek (mirror_seek_sync), which is the only
+// kind that moves the sled on its own. Per step: a fixed cost plus a distance
+// term -- 150 ms + 16 ms/mm, fitted to 310 ms over 0.5 mm, 260 over 8, 373 over
+// 16 and 673 over 32. The earlier constants were fitted to the same curve but
+// spent against UNsynchronised seeks costing 1 ms each, so the budget was never
+// the thing being consumed.
+#define STEP_FIXED_MS        150.0
+#define STEP_PER_MM_MS        16.0
+#define DRIVE_MIN_SEEK_MS    150.0
 
-// Every grind ends with a settle seek, an arrival seek and a PLAY to put the
+// Every grind ends with an overshoot seek, an arrival seek and a PLAY to put the
 // spindle back to 1x. All three land inside the duration being budgeted, and
 // ignoring them is why a 1339 ms seek took 2564 ms: the steps filled the budget
-// and then the tail ran past it.
-#define SEEK_TAIL_MS         570.0
+// and then the tail ran past it. The two seeks are now synchronised, so they
+// cost real time and are real sled movement -- and a reversal at that, which is
+// worth more acoustically than another step in the same direction.
+#define RESUME_PLAY_MS       250.0
 
 static void grime_grind(int from_lba, int to_lba, double total_ms)
 {
@@ -818,34 +854,54 @@ static void grime_grind(int from_lba, int to_lba, double total_ms)
 	double span = r1 - r0;
 	double dist = span < 0 ? -span : span;
 
-	double span_sectors = (double)(to_lba > from_lba ? to_lba - from_lba
-	                                                : from_lba - to_lba);
-
 	// Below the lens-jump range the sled does not move at all, so there is
 	// nothing to make noise with.
 	if (dist < 0.05) { grime_resume(to_lba); return; }
 
-	// This drive cannot make a sled move in under about 200 ms. A short seek
-	// models at less than twice that, so it cannot be subdivided at all without
-	// overrunning -- and a short seek played as a long one is what made a 0.6 mm
-	// hop sound identical to a cross-disc transition. A short seek is one move.
+	// One synchronised move costs 150 ms at the very least. A seek modelled at
+	// less than twice that cannot be subdivided without overrunning -- and a
+	// short seek played as a long one is what made a 0.6 mm hop sound identical
+	// to a cross-disc transition. A short seek is one move.
 	if (total_ms < DRIVE_MIN_SEEK_MS * 2.0 || dist < 0.30) {
-		mirror_seek(mir.dev_fd, to_lba);
+		mirror_seek_sync(mir.dev_fd, to_lba);
 		grime_resume(to_lba);
 		return;
 	}
 
-	double travel_ms = SEEK_PER_SECTOR_MS * span_sectors;
-	int    steps     = (int)((total_ms - travel_ms - SEEK_TAIL_MS) / SEEK_FIXED_MS + 0.5);
+	// Budget. The whole grind has to fit inside the duration the emulated drive
+	// reported, because the game's own timing is built on it; overrunning is what
+	// left the mirror grinding through music it should have been tracking.
+	//
+	// n steps toward the target cost n*FIXED + PER_MM*dist between them (the
+	// distance term is paid once however it is divided). The tail is the
+	// overshoot, the return, and the PLAY that hands the spindle back.
+	double over     = dist * 0.15 + 0.4;
+	double tail_ms  = (grime_level() >= 4)
+	                ? 2.0 * (STEP_FIXED_MS + STEP_PER_MM_MS * over) + RESUME_PLAY_MS
+	                : STEP_FIXED_MS + RESUME_PLAY_MS;
+	int    steps    = (int)((total_ms - STEP_PER_MM_MS * dist - tail_ms)
+	                        / STEP_FIXED_MS + 0.5);
 	if (steps < 1) steps = 1;
 	if (steps > 8) steps = 8;
 
 	int surge = grime_level() >= 8 && !mir.no_read;
 
+	// Log every step and its measured latency. This is the one honest signal:
+	// an unsynchronised seek returns in about 1 ms and has moved nothing, a
+	// synchronised one costs the mechanical time. An external sub-channel poller
+	// cannot see this, because SCSI commands serialise on the device and the
+	// poller stalls behind each in-flight move, observing only net displacement.
+	char lat[160];
+	int  latn = 0;
+	latn += snprintf(lat + latn, sizeof(lat) - latn, "%d steps:", steps);
+
 	for (int i = 1; i <= steps; i++) {
 		if (mirror_aborted()) break;
 		int at = media_lba_at_radius(r0 + span * ((double)i / steps));
-		mirror_seek(mir.dev_fd, at);
+		double st = clock_ms();
+		mirror_seek_sync(mir.dev_fd, at);
+		if (latn < (int)sizeof(lat) - 12)
+			latn += snprintf(lat + latn, sizeof(lat) - latn, " %.0f", clock_ms() - st);
 
 		// Spindle surge: a raw read spins the drive up hard and dropping back
 		// lets it fall, which gives a labouring whine rather than a level tone.
@@ -856,12 +912,11 @@ static void grime_grind(int from_lba, int to_lba, double total_ms)
 	// A worn mechanism overshoots at the end and has to come back. ONE
 	// correction: this is the settle, not the seek, and a sequence of them is
 	// what made every seek sound the same length as every other.
-	if (grime_level() >= 4 && !mirror_aborted()) {
-		double over = dist * 0.15 + 0.4;
-		mirror_seek(mir.dev_fd, lba_offset_mm(to_lba, span > 0 ? over : -over));
-	}
+	if (grime_level() >= 4 && !mirror_aborted())
+		mirror_seek_sync(mir.dev_fd, lba_offset_mm(to_lba, span > 0 ? over : -over));
 
-	mirror_seek(mir.dev_fd, to_lba);
+	mirror_seek_sync(mir.dev_fd, to_lba);
+	acu_log("  grind %.1fmm over %.0fms, %s\n", dist, total_ms, lat);
 
 	// SEEK stops audio playback outright (verified: PLAYING -> DONE), so hand
 	// the spindle back to a true 1x before the mirror carries on.
@@ -1027,21 +1082,47 @@ static void play_gesture(const gesture_t *g)
 				sleep_ms(g->dur_ms - (clock_ms() - start));
 			}
 			else {
-				// A data read is not smooth tracking. The original mechanism
-				// was working hard here -- seeking back over a sector it had to
-				// retry, correcting, reacquiring -- and that busy servo is the
-				// sound of a console LOADING, which is the sound anyone
-				// actually recognises. Re-aiming the head a few times across
-				// the gesture reproduces that; letting it glide does not.
-				int n = 3;
-				// One aim, not three. A PLAY costs about 173 ms on a period
-				// drive, so three of them occupy ~520 ms to represent 240 ms
-				// of game time: the player then runs at half the speed of the
-				// thing it is mirroring, events back up, and a seek comes out
-				// attached to whatever the game was doing a second earlier.
-				// The command's own latency already fills the gesture.
-				(void)n;
-				mirror_play(mir.dev_fd, target, tail);
+				// THE SOUND OF A LOAD IS HERE, and this branch used to sleep
+				// through it. A head trace of a live Sonic CD session found the
+				// sled moving exactly twice in forty seconds: the game asks for
+				// very few seeks, so shaping seeks -- which is what every change
+				// before this one did -- cannot be heard. Everything between
+				// them is a data read, and a data read was one PLAY followed by
+				// a sleep. Silence, for the whole of the only stretch anyone
+				// recognises.
+				//
+				// A Mega CD loading is not quiet and it is not one long sweep.
+				// The CDC takes a short run of sectors, the CDD pauses while the
+				// Sub-CPU drains the buffer, the lens re-locks, and it goes
+				// again -- a few times a second, for as long as the load lasts.
+				// That repeating cadence is the noise.
+				//
+				// So: one real sled move per gesture, alternating back and
+				// forward around the target, which is the resync the mechanism
+				// actually performed. Alternating rather than a pair per gesture
+				// is what makes it affordable -- a SEEK costs about the same as
+				// the PLAY it replaces (~200 ms against ~173 ms), so the player
+				// keeps pace with the core instead of falling a second behind,
+				// and the net head position still lands where the model says.
+				int gl = grime_level();
+				if (gl && !mir.no_read) {
+					// Must clear the lens-jump range or the sled never moves
+					// and there is nothing to hear; kept small so it reads as
+					// chattering in place rather than seeking across the disc.
+					// Synchronised, or the sled does not move at all: a bare
+					// SEEK returns in 1 ms and the next one overwrites it. At
+					// 150 ms + 16 ms/mm this costs about 160 ms, which fits
+					// inside the 250 ms gesture, so the player keeps pace.
+					double amp = 0.22 + 0.07 * gl;
+					mir.read_phase++;
+					if (mir.read_phase & 1)
+						mirror_seek_sync(mir.dev_fd, lba_offset_mm(target, -amp));
+					else
+						mirror_seek_sync(mir.dev_fd, target);
+				}
+				else {
+					mirror_play(mir.dev_fd, target, tail);
+				}
 				if (grime_level() >= 9 && !(grime_rng() % 12)) grime_hunt(target, 1.5, 0);
 				sleep_ms(g->dur_ms - (clock_ms() - start));
 			}
@@ -1116,8 +1197,8 @@ static void play_gesture(const gesture_t *g)
 				if (!mir.on || mir.held || mir.phys_session || mir.dev_fd < 0) break;
 				sleep_ms(90);
 				if (grime_level() && !(grime_rng() % 4)) {
-					mirror_seek(mir.dev_fd, lba_offset_mm(target, 0.12));
-					mirror_seek(mir.dev_fd, target);
+					mirror_seek_sync(mir.dev_fd, lba_offset_mm(target, 0.12));
+					mirror_seek_sync(mir.dev_fd, target);
 					grime_resume(target);
 				}
 			}

@@ -246,10 +246,14 @@ prominent of the three.
 ## Pick the drive by sled speed
 
 The single biggest factor, and the one no software setting can substitute for.
-Measure it as `SEEK(10)` full-stroke latency: `SEEK` waits for the head to
-arrive, and its latency scales smoothly with distance, so it reports actual
-traverse time. `PLAY`'s latency does NOT -- it is mostly audio-servo
-re-acquisition and only a little travel, which is a trap worth avoiding.
+Measure it as full-stroke `SEEK(10)` latency -- but **`SEEK(10)` on its own does
+not wait for the head**. Measured on the Mitsumi, a bare `SEEK` returns in
+**1.0 ms for every distance from 0.5 mm to 32 mm**, which no sled can do: the
+command is queued and acknowledged at once. Follow it with a `READ SUB-CHANNEL`,
+which serialises behind the pending move, and the call then costs the real
+mechanical time and the head lands exactly on target. Every figure in the table
+below is a *synchronised* seek. `PLAY`'s latency is not a substitute -- it is
+mostly audio-servo re-acquisition and only a little travel.
 
 | drive | full-stroke `SEEK(10)` | vs a Mega CD (~800 ms) |
 |-------|-----------------------|------------------------|
@@ -323,19 +327,55 @@ to agree took several wrong turns, and the measurements are worth keeping:
   where 1.5-2x overruns came from, and an overrun is heard as a seek against the
   wrong thing on screen.
 
-What works is solving for the step count from the drive's measured cost curve.
-`SEEK(10)` here costs about **143 ms fixed plus 0.00196 ms per sector** (fitted to
-261 ms at 60000 sectors and 693 ms at 280000). The fixed part dominates, so
+* **An unsynchronised staircase is not a staircase.** This one invalidated
+  everything above it for a while, and it is the single most important fact in
+  this file. A bare `SEEK(10)` returns in ~1 ms without waiting (see "Pick the
+  drive by sled speed"), so steps issued back to back just overwrite each other's
+  targets and the drive performs **one** move -- to the last address. Every
+  staircase, hunt, stutter and overshoot built on bare `SEEK` was silent, and no
+  amount of reshaping them changed anything that could be heard. Anything meant
+  to register as a separate sled movement must go through `mirror_seek_sync()`
+  and pay the mechanical time.
 
-    total = N*FIXED + PER_SECTOR*distance + TAIL   =>   N = (total - travel - TAIL)/FIXED
+What works is solving for the step count from the drive's measured cost curve,
+measured against *synchronised* seeks. One step costs about **150 ms fixed plus
+16 ms per millimetre** (fitted to 310 ms over 0.5 mm, 260 over 8, 373 over 16 and
+673 over 32). `N` steps toward a target pay the fixed cost `N` times but the
+distance term only once, however it is divided:
 
-and `N` is the knob. `TAIL` is ~570 ms and matters: every grind ends with a
-settle seek, an arrival seek and a `PLAY` to restore 1x, and all three land inside
-the budget. Ignoring them is why a 1339 ms seek took 2564 ms -- the steps filled
-the budget and then the tail ran past it.
+    total = N*FIXED + PER_MM*dist + TAIL   =>   N = (total - PER_MM*dist - TAIL)/FIXED
+
+`TAIL` is the overshoot, the return and the `PLAY` that restores 1x. All of them
+land inside the budget, and ignoring them is why a 1339 ms seek took 2564 ms. The
+two tail seeks are synchronised too, so they are real movement -- and a reversal,
+which is worth more acoustically than another step in the same direction.
+
+A Mega CD full stroke (1.5 s modelled, 32 mm) therefore buys a handful of real
+sled movements rather than one. That is the drive's ceiling at a faithful
+duration, and overrunning it is not available: the game's timing is built on the
+duration the emulated drive reported, so a grind that runs long is heard against
+the wrong thing on screen.
 
 Measured after: SPINDOWN 1.00x, cross-disc seek 1.09x, lock-on 1.06x of what the
 model asked for, against 1.9-4.5x before.
+
+### Where the noise of a *load* actually comes from
+
+Not the seeks. A head trace of a live Sonic CD session found the sled moving
+**twice in forty seconds** -- the game asks for very few seeks, so shaping seeks
+cannot carry the sound. Everything between them is a data read, and a data read
+was one `PLAY` followed by a sleep: silence, through the whole of the only
+stretch anyone recognises.
+
+A Mega CD loading is a repeating cadence, not one long sweep. The CDC takes a
+short run of sectors, the CDD pauses while the Sub-CPU drains the buffer, the lens
+re-locks, and it goes again -- a few times a second for as long as the load lasts.
+So a data `STREAM` gesture now makes one real, synchronised sled move, alternating
+back and forward around the target, which is the resync the mechanism performed.
+Gestures are 250 ms, giving a **4 Hz cadence** -- inside the 2-8 Hz a real
+mechanism ran at. Alternating (rather than a back-and-forth pair per gesture) is
+what makes it affordable: one synchronised move costs about the same as the `PLAY`
+it replaces, so the player keeps pace with the core instead of falling behind.
 
 ### Two things deliberately NOT done
 
