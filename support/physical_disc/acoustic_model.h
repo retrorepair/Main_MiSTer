@@ -15,6 +15,7 @@ typedef enum {
 	GEST_STEP,      // short sled move: one chirp
 	GEST_JUMP,      // lens-only jump: the sled does not move, no new noise
 	GEST_STREAM,    // sustained read, head creeping outward under CLV
+	GEST_LOCK,      // on track, spun up, servo acquiring -- not reading yet
 	GEST_HOLD,      // spindle turning, head parked on track, no reads
 	GEST_SPINUP,
 	GEST_SPINDOWN,
@@ -49,6 +50,7 @@ typedef struct {
 	int    spindown_idle_ms;  // idle time before the spindle gives up
 	int    readahead_sectors; // drive buffer: how much it grabs per burst
 	int    calib_sweep;       // sweeps the sled when a disc is loaded
+	int    lock_revs;         // revolutions spent acquiring before audio starts
 } acu_drive_t;
 
 typedef struct {

@@ -14,23 +14,29 @@
 // time and spin speed, so treat them as a good starting point rather than
 // gospel. They are deliberately all in one table so they can be tuned by ear
 // without touching any logic.
+// lock_revs: a drive does not start playing the instant it reaches an audio
+// track. It settles, acquires the subcode and spin-locks first, and the disc
+// turns several times while that happens. On a Mega CD that is audible and
+// unmistakable -- at least six revolutions of the disc before the music starts.
+// Timed from the geometry, so it is longer at the rim where a revolution holds
+// more sectors.
 static const acu_drive_t drives[PD_ACU_PROFILE_COUNT] = {
-	// name       data audio jump short settle sstep stroke spinup sdown  ra sweep
-	{ "auto",      2.0, 1.0,  32,  640,   30,   120,   400,  1500, 8000,  8, 0 },
+	// name       data audio jump short settle sstep stroke spinup sdown  ra sweep lock
+	{ "auto",      2.0, 1.0,  32,  640,   30,   120,   400,  1500, 8000,  8, 0,   4 },
 	// PlayStation: Sony KSM-440, 2x data / 1x audio. Fast, chattery sled.
-	{ "PSX",       2.0, 1.0,  32,  640,   25,   110,   400,  1600, 0,     8, 1 },
+	{ "PSX",       2.0, 1.0,  32,  640,   25,   110,   400,  1600, 0,     8, 1,   3 },
 	// Mega CD / Sega CD: 1x only, slow sled, spins down when left idle.
-	{ "MegaCD",    1.0, 1.0,  24,  480,   55,   220,   800,  2200, 6000,  4, 1 },
+	{ "MegaCD",    1.0, 1.0,  24,  480,   55,   220,   800,  2200, 6000,  4, 1,   6 },
 	// Saturn: 2x, better damped than the PSX.
-	{ "Saturn",    2.0, 1.0,  32,  640,   30,   130,   450,  1800, 0,     8, 1 },
+	{ "Saturn",    2.0, 1.0,  32,  640,   30,   130,   450,  1800, 0,     8, 1,   3 },
 	// PC Engine CD: 1x, seek curve measured by Dave Shadoff.
-	{ "PCECD",     1.0, 1.0,  24,  644,   50,   283,  2300,  2000, 7000,  4, 1 },
+	{ "PCECD",     1.0, 1.0,  24,  644,   50,   283,  2300,  2000, 7000,  4, 1,   5 },
 	// 3DO: 2x on the FZ-10, slow to settle.
-	{ "3DO",       2.0, 1.0,  32,  640,   40,   160,   550,  2000, 0,     8, 1 },
+	{ "3DO",       2.0, 1.0,  32,  640,   40,   160,   550,  2000, 0,     8, 1,   4 },
 	// CD-i: 1x, a deliberately quiet consumer deck.
-	{ "CDi",       1.0, 1.0,  24,  480,   60,   240,   900,  2400, 9000,  4, 0 },
-	// Neo Geo CD: 1x top loader, famously slow.
-	{ "NeoGeoCD",  1.0, 1.0,  24,  480,   70,   260,  1100,  2500, 8000,  4, 1 },
+	{ "CDi",       1.0, 1.0,  24,  480,   60,   240,   900,  2400, 9000,  4, 0,   5 },
+	// Neo Geo CD: 1x top loader, famously slow. Same CDD family as the Mega CD.
+	{ "NeoGeoCD",  1.0, 1.0,  24,  480,   70,   260,  1100,  2500, 8000,  4, 1,   6 },
 };
 
 const acu_drive_t *acu_model_drive(pd_acoustic_profile_t profile)
@@ -46,6 +52,7 @@ const char *acu_gesture_name(gesture_kind_t k)
 	case GEST_STEP:      return "STEP";
 	case GEST_JUMP:      return "JUMP";
 	case GEST_STREAM:    return "STREAM";
+	case GEST_LOCK:      return "LOCK";
 	case GEST_HOLD:      return "HOLD";
 	case GEST_SPINUP:    return "SPINUP";
 	case GEST_SPINDOWN:  return "SPINDOWN";
@@ -289,6 +296,17 @@ void acu_model_event(acu_model_t *m, double now_ms, pd_acoustic_event_t ev, int 
 			// from: a filesystem walk is dozens of these, and the old code
 			// could not see any of them.
 			emit_move(m, m->head_lba, lba);
+
+			// Arriving at an audio track is not the same as playing it. The
+			// drive settles, acquires the subcode and spin-locks first, and the
+			// disc turns several times before any sound comes out. Six
+			// revolutions on a Mega CD, which at 1x is well over a second out
+			// near the rim -- long enough that leaving it out is conspicuous.
+			if (ev == PD_ACU_PLAY && d->lock_revs > 0) {
+				double rev_ms = cd_geom_sectors_per_rev(lba) / 75.0 * 1000.0 / mult;
+				simple(m, GEST_LOCK, lba, d->lock_revs * rev_ms, mult);
+			}
+
 			m->streaming         = 0;
 			m->stream_anchor_lba = lba;
 			m->stream_anchor_ms  = now_ms;

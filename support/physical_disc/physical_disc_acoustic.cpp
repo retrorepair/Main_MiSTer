@@ -1030,6 +1030,27 @@ static void play_gesture(const gesture_t *g)
 			break;
 		}
 
+		case GEST_LOCK: {
+			// Arrived at the track, spun up, not playing yet. The disc turns
+			// several times while the servo settles and acquires the subcode,
+			// and a Mega CD makes that unmistakably audible before the music
+			// starts. So: spindle to a true 1x at the track start, then let it
+			// turn for the modelled number of revolutions, with the occasional
+			// correction a real servo makes while it is locking on.
+			grime_resume(target);
+			double until = start + g->dur_ms;
+			while (clock_ms() < until) {
+				if (!mir.on || mir.held || mir.phys_session || mir.dev_fd < 0) break;
+				sleep_ms(90);
+				if (grime_level() && !(grime_rng() % 4)) {
+					mirror_seek(mir.dev_fd, lba_offset_mm(target, 0.12));
+					mirror_seek(mir.dev_fd, target);
+					grime_resume(target);
+				}
+			}
+			break;
+		}
+
 		case GEST_HOLD:
 			// Spindle on, head held: that is exactly audio pause. A tired
 			// mechanism cannot hold still though -- it drifts off track and has
@@ -1166,6 +1187,13 @@ static void play_gesture(const gesture_t *g)
 		}
 		break;
 	}
+
+	case GEST_LOCK:
+		// Read-mode equivalent: sit on the track while the disc turns, with
+		// the odd correction, before any data starts flowing.
+		touch(target, 1);
+		sleep_ms(g->dur_ms);
+		break;
 
 	case GEST_HOLD:
 		// Spindle still turning, head parked on track. One small read keeps
