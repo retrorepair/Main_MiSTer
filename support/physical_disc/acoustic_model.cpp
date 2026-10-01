@@ -24,22 +24,29 @@
 // Timed from the geometry, so it is longer at the rim where a revolution holds
 // more sectors.
 static const acu_drive_t drives[PD_ACU_PROFILE_COUNT] = {
-	// name       data audio jump short settle sstep stroke spinup sdown  ra sweep lock
-	{ "auto",      2.0, 1.0,  32,  640,   30,   120,   400,  1500, 8000,  8, 0,   4 },
+	// `sstep` is the fixed base cost of any seek; `stroke` the extra for
+	// crossing the whole disc. See acu_model_seek_ms().
+	//
+	// name       data audio jump short settle base stroke spinup sdown  ra sweep lock
+	{ "auto",      2.0, 1.0,  32,  640,   30,   160,  1200,  1500, 8000,  8, 0,   4 },
 	// PlayStation: Sony KSM-440, 2x data / 1x audio. Fast, chattery sled.
-	{ "PSX",       2.0, 1.0,  32,  640,   25,   110,   400,  1600, 0,     8, 1,   3 },
+	{ "PSX",       2.0, 1.0,  32,  640,   25,   120,   800,  1600, 0,     8, 1,   3 },
 	// Mega CD / Sega CD: 1x only, slow sled, spins down when left idle.
-	{ "MegaCD",    1.0, 1.0,  24,  480,   55,   220,   800,  2200, 6000,  4, 1,   6 },
+	// base 160 ms and stroke 1500 ms are Genesis Plus GX's documented figures
+	// (2 + 10 interrupts base; "max. seek time = 1.5 s" across 270000 sectors),
+	// which the MiSTer core's own latency model matches. Measured, not guessed.
+	{ "MegaCD",    1.0, 1.0,  24,  480,   55,   160,  1500,  2200, 6000,  4, 1,   6 },
 	// Saturn: 2x, better damped than the PSX.
-	{ "Saturn",    2.0, 1.0,  32,  640,   30,   130,   450,  1800, 0,     8, 1,   3 },
+	{ "Saturn",    2.0, 1.0,  32,  640,   30,   130,   900,  1800, 0,     8, 1,   3 },
 	// PC Engine CD: 1x, seek curve measured by Dave Shadoff.
 	{ "PCECD",     1.0, 1.0,  24,  644,   50,   283,  2300,  2000, 7000,  4, 1,   5 },
 	// 3DO: 2x on the FZ-10, slow to settle.
-	{ "3DO",       2.0, 1.0,  32,  640,   40,   160,   550,  2000, 0,     8, 1,   4 },
+	{ "3DO",       2.0, 1.0,  32,  640,   40,   160,  1000,  2000, 0,     8, 1,   4 },
 	// CD-i: 1x, a deliberately quiet consumer deck.
-	{ "CDi",       1.0, 1.0,  24,  480,   60,   240,   900,  2400, 9000,  4, 0,   5 },
-	// Neo Geo CD: 1x top loader, famously slow. Same CDD family as the Mega CD.
-	{ "NeoGeoCD",  1.0, 1.0,  24,  480,   70,   260,  1100,  2500, 8000,  4, 1,   6 },
+	{ "CDi",       1.0, 1.0,  24,  480,   60,   240,  1500,  2400, 9000,  4, 0,   5 },
+	// Neo Geo CD: 1x top loader, famously slow. Same CDD family as the Mega CD,
+	// so the same base and stroke, with a slower mechanism around it.
+	{ "NeoGeoCD",  1.0, 1.0,  24,  480,   70,   200,  1700,  2500, 8000,  4, 1,   6 },
 };
 
 const acu_drive_t *acu_model_drive(pd_acoustic_profile_t profile)
@@ -65,9 +72,33 @@ const char *acu_gesture_name(gesture_kind_t k)
 	}
 }
 
+// Seek duration.
+//
+// The shape of this is taken from Genesis Plus GX's cdd.c, which is the
+// reference implementation for Mega CD CD emulation and which the MiSTer core's
+// own latency model agrees with:
+//
+//     cdd.latency  = 2 + 10*cd_latency;                         // base
+//     cdd.latency += ((delta_lba) * 120 * cd_latency) / 270000;  // distance
+//     // "max. seek time = 1.5 s = 1.5 x 75 = 112.5 CDD interrupts
+//     //  (rounded to 120) for 270000 sectors max on disc"
+//
+// So: a fixed base plus a term proportional to the LBA distance, reaching the
+// full-stroke figure across the whole disc. There is no short-seek plateau; an
+// earlier shape invented here had one, and it combined with a full-stroke figure
+// of 800 ms to make every Mega CD seek about half as long as the hardware takes.
+// That is why a track change did not sound like one: the single most audible
+// event the drive produces was being played at double speed.
+//
+// Distance is measured in sectors here, not spiral turns, because that is what
+// both the reference emulator and the core use and therefore what the games'
+// own timing was built against. Turns are still the right measure for deciding
+// WHETHER the sled moves at all, which is a question about the mechanism.
+#define CD_SECTORS_MAX 270000.0
+
 double acu_model_seek_ms(const acu_drive_t *d, int from_lba, int to_lba)
 {
-	double turns  = cd_geom_track_delta(from_lba, to_lba);
+	double turns = cd_geom_track_delta(from_lba, to_lba);
 
 	// Rotational latency: half a revolution at the destination on average,
 	// and a revolution takes longer out at the rim where there are more
@@ -77,19 +108,12 @@ double acu_model_seek_ms(const acu_drive_t *d, int from_lba, int to_lba)
 
 	if (turns <= d->lens_jump_turns) return rot_ms;
 
-	if (turns <= d->short_seek_turns) {
-		double f = turns / (double)d->short_seek_turns;
-		return d->short_seek_ms * (0.55 + 0.45 * f) + rot_ms;
-	}
+	double delta = (double)(to_lba > from_lba ? to_lba - from_lba : from_lba - to_lba);
+	if (delta > CD_SECTORS_MAX) delta = CD_SECTORS_MAX;
 
-	// Coarse slew: cost above the short-seek break scales with the travel
-	// still to cover.
-	double total_turns = (CD_R_OUTER_MM - CD_R_INNER_MM) / CD_TRACK_PITCH_MM;
-	double span = total_turns - d->short_seek_turns;
-	if (span < 1.0) span = 1.0;
-	double f = (turns - d->short_seek_turns) / span;
-	if (f > 1.0) f = 1.0;
-	return d->short_seek_ms + (d->full_stroke_ms - d->short_seek_ms) * f + rot_ms;
+	return d->short_seek_ms                                     // base cost
+	     + d->full_stroke_ms * (delta / CD_SECTORS_MAX)         // travel
+	     + rot_ms;
 }
 
 // "Where the head is now" -- only the newest of these carries any information,

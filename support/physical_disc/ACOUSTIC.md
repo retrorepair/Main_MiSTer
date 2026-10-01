@@ -262,3 +262,47 @@ overshoot or grime makes it laboured -- it just makes it busy. On the Mitsumi
 the mechanism is doing the work, so faithful settings are the right ones:
 `GAIN=1` and a low `GRIME`. Grime levels tuned on a fast sled will be far too
 aggressive here, since each overshoot pass is now a real 200-700 ms traverse.
+
+## Where the Mega CD seek timing comes from
+
+Not guessed. Genesis Plus GX's `core/cd_hw/cdd.c` is the reference
+implementation for Mega CD CD emulation, and the MiSTer core's own latency model
+agrees with it:
+
+```c
+cdd.latency  = 2 + 10*config.cd_latency;                        // base
+cdd.latency += ((delta_lba) * 120 * config.cd_latency) / 270000; // distance
+// "max. seek time = 1.5 s = 1.5 x 75 = 112.5 CDD interrupts
+//  (rounded to 120) for 270000 sectors max on disc"
+```
+
+A fixed base of 2+10 interrupts (~160 ms at 75 Hz) plus a term proportional to
+LBA distance, reaching **1.5 s across the whole disc**. No short-seek plateau.
+
+That matters because a data-to-audio transition is two of those plus the
+lock-on, which is where the three seconds people remember comes from: a Mega CD
+game loading while music plays has to stop the audio, cross to the data track,
+read, and cross back.
+
+An earlier shape invented here had a short-seek plateau and a full-stroke figure
+of 800 ms, making every Mega CD seek about half as long as the hardware takes --
+the single most audible thing the drive does, played at double speed.
+
+Distance is measured in sectors for the DURATION, because that is what both the
+reference emulator and the core use and therefore what the games' timing was
+built against. Spiral turns remain the right measure for deciding WHETHER the
+sled moves at all, which is a question about the mechanism rather than about
+emulated timing.
+
+### Turning that into traverses
+
+One traverse of this drive is 693 ms across the whole disc, measured, so a single
+traverse is well short of a Mega CD seek. The player divides the modelled
+duration by the drive's own measured traverse time -- `SEEK(10)` latency rises
+close to linearly with distance (28 ms at 500 sectors, 188 at 20000, 392 at
+150000, 693 at 280000) -- and crosses the distance that many times.
+
+Deriving the count this way rather than from invented distance thresholds is what
+makes correcting the model's timing actually change what comes out of the drive.
+Measured afterwards: 3.6 s of continuous sled movement on a data-to-audio
+transition.

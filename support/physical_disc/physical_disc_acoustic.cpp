@@ -775,8 +775,6 @@ static void grime_grind(int from_lba, int to_lba, double total_ms)
 	// So take the smaller of the two counts and let the traverse finish early
 	// if the distance simply cannot fill the time. A short seek being short is
 	// correct anyway.
-	(void)total_ms;
-
 	// A single long seek IS the grind, and trying to synthesise one out of
 	// small steps was simply the wrong idea.
 	//
@@ -791,15 +789,28 @@ static void grime_grind(int from_lba, int to_lba, double total_ms)
 	// So make the traverses FEWER and LONGER, not more and shorter. A worn
 	// mechanism overshoots and has to come back, and each of those passes is a
 	// full continuous grind in its own right.
-	// A long move earns more passes than a short one. A near-full-stroke
-	// traverse is about 700 ms on a period drive, and a real Mega CD spends
-	// roughly three seconds hunting out an audio track -- so crossing the disc
-	// takes several goes, while a short hop does not. Scaling only with the
-	// grime level made a 20 mm move and a 1 mm move take the same time, which
-	// is why starting a track was not the event it should have been.
-	int passes = 1 + grime_level() / 4;             // 1..3 from wear alone
-	if (dist > 15.0)     passes += 2;               // crossing the disc
-	else if (dist > 5.0) passes += 1;
+	// How many traverses it takes to fill the time the ORIGINAL drive would
+	// have spent on this seek.
+	//
+	// The model's figure is sourced: a Mega CD seek is a 160 ms base plus up to
+	// 1.5 s across the disc. This drive crosses the whole disc in 693 ms --
+	// measured, SEEK(10) latency, which rises close to linearly with distance
+	// (28 ms at 500 sectors, 188 at 20000, 392 at 150000, 693 at 280000). One
+	// traverse is therefore well short of a Mega CD seek, and the honest way to
+	// make up the difference is to cross the distance as many times as it takes.
+	//
+	// Deriving it this way rather than from invented distance thresholds means
+	// correcting the model's timing actually changes what comes out of the
+	// drive, which it previously did not.
+	double span_sectors = (double)(to_lba > from_lba ? to_lba - from_lba
+	                                                : from_lba - to_lba);
+	double traverse_ms  = 30.0 + 2.4 * (span_sectors / 1000.0);
+	if (traverse_ms < 40.0) traverse_ms = 40.0;
+
+	int passes = (int)(total_ms / traverse_ms + 0.5);
+	passes += grime_level() / 4;                    // wear adds its own hunting
+	if (passes < 1)  passes = 1;
+	if (passes > 10) passes = 10;
 	int surge  = grime_level() >= 8 && !mir.no_read;
 
 	for (int i = 0; i < passes; i++) {
