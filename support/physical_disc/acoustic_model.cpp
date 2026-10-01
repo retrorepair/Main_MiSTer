@@ -250,7 +250,7 @@ void acu_model_event(acu_model_t *m, double now_ms, pd_acoustic_event_t ev, int 
 			m->spinning  = 0;
 			m->streaming = 0;
 			m->holding   = 0;
-			simple(m, GEST_SPINDOWN, m->head_lba, 600.0, 0.0);
+			simple(m, GEST_SPINDOWN, m->head_lba, d->spinup_ms, 0.0);   // coasts down about as long as it ramps up
 		}
 		break;
 
@@ -367,6 +367,6 @@ void acu_model_tick(acu_model_t *m, double now_ms)
 
 	if (m->spinning && d->spindown_idle_ms > 0 && idle > d->spindown_idle_ms) {
 		m->spinning = 0;
-		simple(m, GEST_SPINDOWN, m->head_lba, 600.0, 0.0);
+		simple(m, GEST_SPINDOWN, m->head_lba, d->spinup_ms, 0.0);   // coasts down about as long as it ramps up
 	}
 }

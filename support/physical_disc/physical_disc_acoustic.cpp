@@ -86,6 +86,7 @@ typedef struct {
 	volatile int alive;
 	volatile int disabled_perm;
 	volatile int no_read;
+	volatile int spun;        // do we believe the spindle is actually turning
 	volatile int play_mode;   // drive runs the mechanism via PLAY AUDIO at true 1x
 	volatile int shrinks;     // reactive span pull-ins, reset on each acquire
 	volatile int raw_read;   // drive accepts READ CD (0xBE), so audio works too
@@ -131,6 +132,22 @@ static void sleep_ms(double ms)
 	ts.tv_sec  = (time_t)(ms / 1000.0);
 	ts.tv_nsec = (long)((ms - ts.tv_sec * 1000.0) * 1e6);
 	nanosleep(&ts, NULL);
+}
+
+// Some things genuinely take seconds -- a spindle ramping up or coasting down is
+// the obvious one -- and the 500 ms clamp above silently truncated every one of
+// them. A spin-up modelled at 2200 ms was waiting 500 ms and then being cut off
+// by the next command, which is why neither end of the spin cycle sounded right.
+// Waits in chunks so it still notices being told to stop.
+static int mirror_aborted(void);
+
+static void sleep_long_ms(double ms)
+{
+	double end = clock_ms() + ms;
+	while (clock_ms() < end) {
+		if (mirror_aborted()) return;
+		sleep_ms(100);
+	}
 }
 
 // ---------------------------------------------------------------- SCSI ----
@@ -471,6 +488,7 @@ static int mirror_acquire(void)
 		mir.r_lo = media_radius_mm(mir.span_lo);
 		mir.r_hi = media_radius_mm(mir.span_hi);
 
+		mir.spun      = 0;
 		mir.no_read   = 0;
 		mir.shrinks   = 0;
 		mir.play_mode = 0;
@@ -655,6 +673,11 @@ static int touch(int lba, int blocks)
 static int own_device(void)
 {
 	return mir.dev_fd >= 0 && !mir.phys_session;
+}
+
+static int mirror_aborted(void)
+{
+	return !mir.on || mir.held || mir.phys_session || mir.dev_fd < 0;
 }
 
 // ------------------------------------------------------------- grime -------
@@ -1051,17 +1074,33 @@ static void play_gesture(const gesture_t *g)
 			break;
 
 		case GEST_SPINUP:
+			// The ramp IS the sound, so it has to be allowed to happen before
+			// anything else is asked of the drive. START STOP UNIT is an
+			// immediate command and returns at once, so following it straight
+			// away with PLAY hauled the disc to 1x and the ramp was never
+			// heard. Only wait when the spindle really was stopped, or every
+			// resume picks up a spin-up it does not deserve.
 			mirror_spin(mir.dev_fd, 1);
+			if (!mir.spun) {
+				sleep_long_ms(g->dur_ms * 0.7);
+				mir.spun = 1;
+			}
 			mirror_play(mir.dev_fd, target, tail);
 			// A hazy lens takes several goes to focus. Everyone who owned one
 			// of these knows the sound of a console thinking about it.
-			grime_hunt(target, 4.0, 3);
-			sleep_ms(g->dur_ms - (clock_ms() - start));
+			grime_hunt(target, 4.0, 2);
+			sleep_long_ms(g->dur_ms * 0.3 - (clock_ms() - start));
 			break;
 
 		case GEST_SPINDOWN:
+			// Coasting down takes seconds and had no wait at all, so the next
+			// gesture's PLAY spun the disc back up before any of it was
+			// audible. Playback has to be stopped first, or the drive keeps the
+			// spindle running to service it and the stop is ignored.
 			mirror_stop_play(mir.dev_fd);
 			if (own_device()) mirror_spin(mir.dev_fd, 0);
+			mir.spun = 0;
+			sleep_long_ms(g->dur_ms);
 			break;
 
 		case GEST_SWEEP: {
@@ -1199,6 +1238,8 @@ static void play_gesture(const gesture_t *g)
 
 	case GEST_SPINDOWN:
 		if (own_device() && !mir.no_read) mirror_spin(mir.dev_fd, 0);
+		mir.spun = 0;
+		sleep_long_ms(g->dur_ms);
 		break;
 
 	case GEST_SWEEP: {
