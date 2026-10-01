@@ -952,27 +952,16 @@ static void play_gesture(const gesture_t *g)
 				// actually recognises. Re-aiming the head a few times across
 				// the gesture reproduces that; letting it glide does not.
 				int n = 3;
-				double slot = g->dur_ms / n;
-				int span = (int)(g->rate_sectors_s * g->dur_ms / 1000.0 / n);
-				if (span < 1) span = 1;
-				for (int i = 0; i < n; i++) {
-					if (!mir.on || mir.held || mir.phys_session || mir.dev_fd < 0) break;
-					int at  = target + i * span;
-					if (at > mir.span_hi) at = mir.span_hi;
-					int blk = mir.span_hi - at; if (blk < 1) blk = 1;
-					double t0 = clock_ms();
-					mirror_play(mir.dev_fd, at, blk);
-					// A scuffed data track is where a tired servo loses lock
-					// most often, and the re-read stutter is the sound of it.
-					// Seasoning only. This read-retry stutter was dominating
-					// and reading as "poor disc" rather than "old mechanism";
-					// the seeks are what should carry the character.
-					// Near-silent now by design. Micro-hunts were adding a
-					// constant buzz that muddied the seeks, and a buzz is not
-					// what a worn drive sounds like anyway.
-					if (grime_level() >= 9 && !(grime_rng() % 12)) grime_hunt(at, 1.5, 0);
-					sleep_ms(slot - (clock_ms() - t0));
-				}
+				// One aim, not three. A PLAY costs about 173 ms on a period
+				// drive, so three of them occupy ~520 ms to represent 240 ms
+				// of game time: the player then runs at half the speed of the
+				// thing it is mirroring, events back up, and a seek comes out
+				// attached to whatever the game was doing a second earlier.
+				// The command's own latency already fills the gesture.
+				(void)n;
+				mirror_play(mir.dev_fd, target, tail);
+				if (grime_level() >= 9 && !(grime_rng() % 12)) grime_hunt(target, 1.5, 0);
+				sleep_ms(g->dur_ms - (clock_ms() - start));
 			}
 			break;
 		}
@@ -1290,6 +1279,35 @@ static void *worker_main(void *arg)
 		if (!acu_model_poll(&model, &g)) {
 			sleep_ms(10);
 			continue;
+		}
+
+		// Stay current rather than complete.
+		//
+		// A period drive's mechanism is slow -- that is the whole point of
+		// using one -- so playing a gesture takes far longer than the slice of
+		// game time it represents. Work through a backlog and the sled ends up
+		// moving for something the game did a second ago, which is heard as the
+		// right noises at the wrong moments.
+		//
+		// The drive can only be in one place, so a queue of gestures is not a
+		// list of work, it is successively better information about where the
+		// head should be. Take the newest. The exception is a real move: a
+		// SLEW, STEP or SWEEP is the thing worth hearing, so it is never
+		// discarded in favour of a stream or a hold that merely arrived later.
+		{
+			gesture_t next;
+			int dropped_here = 0;
+			while (acu_model_poll(&model, &next)) {
+				int g_is_move    = (g.kind == GEST_SLEW || g.kind == GEST_STEP ||
+				                    g.kind == GEST_SWEEP || g.kind == GEST_SPINUP);
+				int next_is_move = (next.kind == GEST_SLEW || next.kind == GEST_STEP ||
+				                    next.kind == GEST_SWEEP || next.kind == GEST_SPINUP);
+				if (!g_is_move || next_is_move) g = next;
+				dropped_here++;
+			}
+			if (dropped_here)
+				acu_log("behind by %d gesture%s, skipping to %s\n", dropped_here,
+				        dropped_here == 1 ? "" : "s", acu_gesture_name(g.kind));
 		}
 
 		// Nothing to open the drive for unless there is real work.
