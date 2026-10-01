@@ -814,11 +814,28 @@ static void grime_grind(int from_lba, int to_lba, double total_ms)
 	// resumed. That is heard as a long seek during playback, which no real drive
 	// does. Those settles were also the jitter: audible gaps mid-traverse, where
 	// a real sled crossing the disc does not stop on the way.
-	(void)traverse_ms;
+	// This drive cannot make a sled move in less than about 200 ms -- measured,
+	// SEEK(10): 28 ms for 500 sectors but 216 ms by 3000, so there is a large
+	// fixed cost the moment the sled is involved at all. A short Mega CD seek is
+	// 286 ms, which does not fit even one traverse plus the final arrival, so
+	// trying to grind one produced 1278 ms and sounded exactly like a cross-disc
+	// transition. A short seek is one short move; that is all it ever was.
+	#define DRIVE_MIN_TRAVERSE_MS 200.0
+
+	if (total_ms < DRIVE_MIN_TRAVERSE_MS * 2.0) {
+		mirror_seek(mir.dev_fd, to_lba);
+		grime_resume(to_lba);
+		return;
+	}
+
 	double deadline = clock_ms() + total_ms;
 	int surge = grime_level() >= 8 && !mir.no_read;
 
-	for (int i = 0; i < 10 && clock_ms() < deadline; i++) {
+	// Stop when the NEXT traverse would not fit, rather than when the deadline
+	// has already passed: a traverse cannot be interrupted once issued, so
+	// checking afterwards guarantees an overrun of a whole move.
+	double cost = traverse_ms > DRIVE_MIN_TRAVERSE_MS ? traverse_ms : DRIVE_MIN_TRAVERSE_MS;
+	for (int i = 0; i < 10 && clock_ms() + cost < deadline; i++) {
 		if (!mir.on || mir.held || mir.phys_session || mir.dev_fd < 0) break;
 
 		// Overshoot past the target, alternating side and shrinking each time,
@@ -829,7 +846,18 @@ static void grime_grind(int from_lba, int to_lba, double total_ms)
 		// near-silence on this drive however faithfully it is reproduced. The
 		// overshoot is what turns one into real audible travel, so it scales
 		// with the grime level rather than only with the distance.
-		double over = (dist * 0.35 + 1.5 + grime_level() * 0.9) / (i + 1);
+		// Overshoot PROPORTIONAL to the distance, with only a token floor.
+		//
+		// This had a large wear-driven floor -- about 7.9 mm at grime 7 whatever
+		// the seek -- added to make short hops audible. It worked, and it
+		// destroyed the thing that actually matters. Measured on hardware: a
+		// 0.6 mm hop took 1506 ms against the 243 ms the model asked for, and
+		// STEP and SLEW were both coming out between 1.5 and 2.3 seconds. So a
+		// short seek sounded exactly like a cross-disc transition.
+		//
+		// The long seek was never missing. It had no contrast, because
+		// everything else was just as long.
+		double over = (dist * (0.35 + grime_level() * 0.03) + 0.3) / (i + 1);
 		if (i & 1) over = -over;
 		int at = lba_offset_mm(to_lba, span > 0 ? over : -over);
 
@@ -930,6 +958,11 @@ static int amplified_mirror_lba(int game_lba, int resync)
 	if (lba > mir.span_hi) lba = mir.span_hi;
 	return lba;
 }
+
+// Wall-clock cost of the last gesture, so the trace can show what the drive
+// really did against what the model asked for. Without this a gesture that
+// returns early is indistinguishable from one that was never emitted.
+static double gesture_actual_ms;
 
 static int mir_prev_lba = -1;    // last place we actually sent the head
 
@@ -1441,7 +1474,12 @@ static void *worker_main(void *arg)
 			if (mirror_acquire()) { sleep_ms(100); continue; }
 		}
 
+		double g_t0 = clock_ms();
 		play_gesture(&g);
+		gesture_actual_ms = clock_ms() - g_t0;
+		if (g.kind != GEST_STREAM && g.kind != GEST_JUMP)
+			acu_log("  %-8s took %5.0fms, model wanted %5.0fms\n",
+			        acu_gesture_name(g.kind), gesture_actual_ms, g.dur_ms);
 	}
 
 	mirror_release();
