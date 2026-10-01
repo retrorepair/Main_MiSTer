@@ -686,36 +686,55 @@ static int grime_level(void)
 	return g;
 }
 
-// Fires with a probability that rises with the grime level.
-static int grime_hits(int per_ten_percent)
+// Put the head at a radius, not at a sector. A hunt has to be specified in
+// millimetres or it does not do anything: 1000 sectors is about 0.1 mm out at
+// the rim, which the servo covers with the lens alone and you hear nothing.
+// Moving the sled needs of the order of 6000 sectors near the hub and 12000
+// near the rim, and only a radial figure gets that right at both ends.
+static int lba_offset_mm(int lba, double delta_mm)
 {
-	int g = grime_level();
-	if (!g) return 0;
-	return (int)(grime_rng() % 100) < (g * per_ten_percent);
+	int out = media_lba_at_radius(media_radius_mm(lba) + delta_mm);
+	if (out < mir.span_lo) out = mir.span_lo;
+	if (out > mir.span_hi) out = mir.span_hi;
+	return out;
 }
 
-// A tracking hunt: the servo slips back, reacquires, and catches up. One short
-// sled twitch each way, which is audible on a tired mechanism and is the
-// signature of a disc the drive is struggling to follow.
-static void grime_hunt(int lba, int reach)
+static void grime_aim(int lba)
 {
-	if (mir.dev_fd < 0 || mir.phys_session) return;
-
-	int back = lba - reach;
-	if (back < mir.span_lo) back = mir.span_lo;
-
 	if (mir.play_mode) {
-		int blk = mir.span_hi - back; if (blk < 1) blk = 1;
-		mirror_play(mir.dev_fd, back, blk);
-		sleep_ms(18 + (grime_rng() % 40));
-		blk = mir.span_hi - lba; if (blk < 1) blk = 1;
+		int blk = mir.span_hi - lba;
+		if (blk < 1) blk = 1;
 		mirror_play(mir.dev_fd, lba, blk);
 	}
 	else {
-		touch(back, 2);
-		sleep_ms(18 + (grime_rng() % 40));
 		touch(lba, 2);
 	}
+}
+
+// A worn mechanism does not slip once and recover neatly. It slips, grabs,
+// slips again, hunts past, comes back -- a burst of sled movement. `reach_mm`
+// is how far it wanders and `reps` how many times before it gives up and
+// settles, both scaled by the grime level.
+static void grime_hunt(int lba, double reach_mm, int reps)
+{
+	int g = grime_level();
+	if (!g || mir.dev_fd < 0 || mir.phys_session) return;
+
+	// Chance of misbehaving at all: level 6 is most of the time, 10 is always.
+	if ((int)(grime_rng() % 100) >= g * 10) return;
+
+	reach_mm *= 0.4 + g / 5.0;
+	reps     += g / 3;
+
+	for (int i = 0; i < reps; i++) {
+		if (!mir.on || mir.held || mir.phys_session || mir.dev_fd < 0) break;
+		// Wander mostly inwards, sometimes past the target, never neatly.
+		double away = reach_mm * (0.35 + (grime_rng() % 100) / 100.0);
+		if (grime_rng() & 1) away = -away;
+		grime_aim(lba_offset_mm(lba, away));
+		sleep_ms(14 + (grime_rng() % 46));
+	}
+	grime_aim(lba);           // finally settles where it was supposed to be
 }
 
 // A gesture carries how long the original mechanism would have taken. The USB
@@ -820,6 +839,10 @@ static void play_gesture(const gesture_t *g)
 				int drift = (pos < 0) ? INT_MAX
 				          : (pos > target ? pos - target : target - pos);
 				if (!playing || drift > 400) mirror_play(mir.dev_fd, target, tail);
+				// A scratched disc makes a CD player hunt and skip mid-track.
+				// Gentler than on a data read, because the drive is not also
+				// fighting to get the sector right.
+				grime_hunt(target, 0.8, 1);
 				sleep_ms(g->dur_ms - (clock_ms() - start));
 			}
 			else {
@@ -842,7 +865,7 @@ static void play_gesture(const gesture_t *g)
 					mirror_play(mir.dev_fd, at, blk);
 					// A scuffed data track is where a tired servo loses lock
 					// most often, and the re-read stutter is the sound of it.
-					if (grime_hits(7)) grime_hunt(at, 120 + (int)(grime_rng() % 900));
+					grime_hunt(at, 1.2, 2);
 					sleep_ms(slot - (clock_ms() - t0));
 				}
 			}
@@ -872,13 +895,17 @@ static void play_gesture(const gesture_t *g)
 			// A dry sled overshoots and has to come back. On the last stage of
 			// a long seek that correction is very audible, and it is why an old
 			// console takes two goes to settle before it starts reading.
-			if (grime_hits(9)) grime_hunt(target, 400 + (int)(grime_rng() % 2600));
+			grime_hunt(target, 3.0, 2);
 			break;
 		}
 
 		case GEST_HOLD:
-			// Spindle on, head held: that is exactly audio pause.
+			// Spindle on, head held: that is exactly audio pause. A tired
+			// mechanism cannot hold still though -- it drifts off track and has
+			// to pull itself back, which is the idle fidgeting you hear from a
+			// console sitting on a menu.
 			mirror_pause(mir.dev_fd, 0);
+			grime_hunt(from, 1.0, 1);
 			sleep_ms(g->dur_ms);
 			break;
 
@@ -887,8 +914,7 @@ static void play_gesture(const gesture_t *g)
 			mirror_play(mir.dev_fd, target, tail);
 			// A hazy lens takes several goes to focus. Everyone who owned one
 			// of these knows the sound of a console thinking about it.
-			for (int i = 0; i < grime_level() / 3 + (grime_hits(5) ? 1 : 0); i++)
-				grime_hunt(target, 800 + (int)(grime_rng() % 4000));
+			grime_hunt(target, 4.0, 3);
 			sleep_ms(g->dur_ms - (clock_ms() - start));
 			break;
 
