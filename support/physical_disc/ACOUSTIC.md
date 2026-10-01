@@ -242,3 +242,23 @@ mechanical. The slot-loader is engineered to be silent and no software setting
 changes that; an older tray drive is the single biggest improvement available.
 The CD-RW's sled is slower than a real Mega CD's, which makes its seeks the most
 prominent of the three.
+
+## Pick the drive by sled speed
+
+The single biggest factor, and the one no software setting can substitute for.
+Measure it as `SEEK(10)` full-stroke latency: `SEEK` waits for the head to
+arrive, and its latency scales smoothly with distance, so it reports actual
+traverse time. `PLAY`'s latency does NOT -- it is mostly audio-servo
+re-acquisition and only a little travel, which is a trap worth avoiding.
+
+| drive | full-stroke `SEEK(10)` | vs a Mega CD (~800 ms) |
+|-------|-----------------------|------------------------|
+| modern slot-load | — (silent regardless) | — |
+| IDE-CD R/RW 8x4x32 | 168 ms | ~5x too fast |
+| **Mitsumi FX120T (12x, ~1997)** | **693 ms** | **within ~15%** |
+
+On a 168 ms sled a traverse is over before you hear it, and no amount of
+overshoot or grime makes it laboured -- it just makes it busy. On the Mitsumi
+the mechanism is doing the work, so faithful settings are the right ones:
+`GAIN=1` and a low `GRIME`. Grime levels tuned on a fast sled will be far too
+aggressive here, since each overshoot pass is now a real 200-700 ms traverse.
