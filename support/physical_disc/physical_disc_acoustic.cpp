@@ -86,6 +86,7 @@ typedef struct {
 	volatile int alive;
 	volatile int disabled_perm;
 	volatile int no_read;
+	volatile int shrinks;     // reactive span pull-ins, reset on each acquire
 	volatile int raw_read;   // drive accepts READ CD (0xBE), so audio works too
 	volatile int profile_req;
 
@@ -336,6 +337,7 @@ static int mirror_acquire(void)
 		mir.r_hi = media_radius_mm(mir.span_hi);
 
 		mir.no_read  = 0;
+		mir.shrinks  = 0;
 		mir.dev_fd   = fd;
 
 		// Pick the read command once, here, by trying them. READ(10)+FUA is
@@ -445,9 +447,19 @@ static int touch(int lba, int blocks)
 	// not recorded that far, or its outer edge is unreadable -- not that the
 	// drive cannot read. Pull the usable span in and carry on reading, rather
 	// than condemning the whole session to seek-only and going quiet.
+	// Before blaming the disc, check whether it is even the same disc. Swapping
+	// the mirror disc leaves us holding a stale TOC, and every read then fails
+	// for a reason that has nothing to do with how far the media is recorded.
+	// Shrinking on that is actively wrong: it was measured collapsing a fresh
+	// full disc's stroke to 1 mm because the span came from the previous one.
+	if (r == -2 && ioctl(mir.dev_fd, CDROM_MEDIA_CHANGED, CDSL_CURRENT) > 0) {
+		acu_log("mirror disc changed, re-reading its TOC\n");
+		mirror_release();
+		return -1;
+	}
+
 	if (!mir.no_read && r == -2 && lba > mir.span_lo + (mir.span_hi - mir.span_lo) / 8) {
-		static int shrinks = 0;
-		if (++shrinks <= 10) {
+		if (++mir.shrinks <= 10) {
 			int keep = lba - (BURST_MAX + END_GUARD_SECTORS);
 			if (keep < mir.span_lo) keep = mir.span_lo;
 			mir.span_hi = keep;
