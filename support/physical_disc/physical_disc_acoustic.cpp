@@ -1325,33 +1325,44 @@ static void *worker_main(void *arg)
 			continue;
 		}
 
-		// Stay current rather than complete.
+		// Collapse position updates, but never collapse movement.
 		//
-		// A period drive's mechanism is slow -- that is the whole point of
-		// using one -- so playing a gesture takes far longer than the slice of
-		// game time it represents. Work through a backlog and the sled ends up
-		// moving for something the game did a second ago, which is heard as the
-		// right noises at the wrong moments.
+		// A period drive is slow -- that is why we want one -- so playing a
+		// gesture takes longer than the slice of game time it represents, and
+		// working through a backlog puts the sled in motion for something the
+		// game did a second ago. But the first version of this kept only ONE
+		// gesture when behind, and that quietly destroyed the best sound the
+		// feature has. A scene transition is a BURST of seeks -- the filesystem
+		// walk, then the asset -- and the sequence is what makes it three
+		// seconds of audible sled. Collapsing it to the newest left a single
+		// 700 ms traverse where there should have been four.
 		//
-		// The drive can only be in one place, so a queue of gestures is not a
-		// list of work, it is successively better information about where the
-		// head should be. Take the newest. The exception is a real move: a
-		// SLEW, STEP or SWEEP is the thing worth hearing, so it is never
-		// discarded in favour of a stream or a hold that merely arrived later.
+		// The distinction: a STREAM, JUMP or HOLD is merely "where the head is
+		// now", so only the newest is worth anything. A SLEW, STEP or SWEEP is
+		// an event with its own sound, and every one of them gets played in
+		// order. Moves are rare next to streams -- single figures against
+		// hundreds -- so keeping all of them costs almost nothing.
 		{
+			#define IS_MOVE(k) ((k) == GEST_SLEW || (k) == GEST_STEP || \
+			                    (k) == GEST_SWEEP || (k) == GEST_SPINUP || \
+			                    (k) == GEST_SPINDOWN || (k) == GEST_PARK)
+
 			gesture_t next;
-			int dropped_here = 0;
-			while (acu_model_poll(&model, &next)) {
-				int g_is_move    = (g.kind == GEST_SLEW || g.kind == GEST_STEP ||
-				                    g.kind == GEST_SWEEP || g.kind == GEST_SPINUP);
-				int next_is_move = (next.kind == GEST_SLEW || next.kind == GEST_STEP ||
-				                    next.kind == GEST_SWEEP || next.kind == GEST_SPINUP);
-				if (!g_is_move || next_is_move) g = next;
-				dropped_here++;
+			int collapsed = 0;
+
+			if (!IS_MOVE(g.kind)) {
+				// Scan forward for a move. If one is queued it takes priority
+				// over any number of stale position updates; if not, the newest
+				// update is the only one that means anything.
+				while (acu_model_poll(&model, &next)) {
+					collapsed++;
+					g = next;
+					if (IS_MOVE(g.kind)) break;
+				}
 			}
-			if (dropped_here)
-				acu_log("behind by %d gesture%s, skipping to %s\n", dropped_here,
-				        dropped_here == 1 ? "" : "s", acu_gesture_name(g.kind));
+			if (collapsed)
+				acu_log("collapsed %d stale update%s, now %s\n", collapsed,
+				        collapsed == 1 ? "" : "s", acu_gesture_name(g.kind));
 		}
 
 		// Nothing to open the drive for unless there is real work.
