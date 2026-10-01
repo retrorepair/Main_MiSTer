@@ -700,16 +700,23 @@ static int lba_offset_mm(int lba, double delta_mm)
 	return out;
 }
 
+// Move the head and nothing else. SEEK(10) costs about 42 ms against PLAY's
+// 200 ms, measured, because PLAY re-establishes the audio servo every time. For
+// anything meant to sound quick -- a stutter, a hunt, a staircase step -- PLAY
+// is simply too slow a primitive and turns it into a series of clunks.
 static void grime_aim(int lba)
 {
-	if (mir.play_mode) {
-		int blk = mir.span_hi - lba;
-		if (blk < 1) blk = 1;
-		mirror_play(mir.dev_fd, lba, blk);
-	}
-	else {
-		touch(lba, 2);
-	}
+	if (mir.play_mode) mirror_seek(mir.dev_fd, lba);
+	else               touch(lba, 2);
+}
+
+// SEEK leaves audio playback stopped, so put the spindle back to a true 1x.
+static void grime_resume(int lba)
+{
+	if (!mir.play_mode || mir.dev_fd < 0 || mir.phys_session) return;
+	int blk = mir.span_hi - lba;
+	if (blk < 1) blk = 1;
+	mirror_play(mir.dev_fd, lba, blk);
 }
 
 // A long, laboured traverse -- the thing an old console actually sounds like
@@ -745,36 +752,42 @@ static void grime_grind(int from_lba, int to_lba, double total_ms)
 	// So take the smaller of the two counts and let the traverse finish early
 	// if the distance simply cannot fill the time. A short seek being short is
 	// correct anyway.
+	// The steps are SEEK(10), not PLAY. Measured on the drive here, a 70-step
+	// staircase costs 42 ms per step with SEEK and 200 ms per step with PLAY,
+	// because PLAY has to re-establish the audio servo every time. At 200 ms
+	// apart the sled stops between every step and the result is a row of
+	// clunks -- which is what the PLAY version of this actually sounded like.
+	// SEEK is the bare positioning command and its own latency paces the
+	// staircase at about the right cadence with no sleeping required.
 	#define GRIND_STEP_MIN_MM  0.06
-	#define GRIND_SLOT_MS      34.0
+	#define GRIND_SEEK_MS      42.0
 
 	int n_by_step = (int)(dist / GRIND_STEP_MIN_MM);
-	int n         = (int)(total_ms / GRIND_SLOT_MS);
+	int n         = (int)(total_ms / GRIND_SEEK_MS);
 	if (n > n_by_step) n = n_by_step;
 	if (n < 2)   n = 2;
 	if (n > 240) n = 240;
-
-	double slot = total_ms / n;
-	if (slot > GRIND_SLOT_MS * 1.4) slot = GRIND_SLOT_MS * 1.4;
 
 	int surge = grime_level() >= 8 && !mir.no_read;
 
 	for (int i = 1; i <= n; i++) {
 		if (!mir.on || mir.held || mir.phys_session || mir.dev_fd < 0) break;
-		double t0 = clock_ms();
 		int at = media_lba_at_radius(r0 + span * ((double)i / n));
-		grime_aim(at);
 
-		// Spindle surge. PLAY AUDIO holds a steady 1x, but a raw read makes the
-		// drive spin up hard to stream data, and dropping back to playback lets
-		// it fall again. Layering that over the sled grind gives the rising and
-		// falling whine of a mechanism labouring, instead of a level tone. Only
-		// worth it high up the dial, and failure is fine -- we want the spin-up,
-		// not the bytes.
-		if (surge && !(grime_rng() % 5)) mirror_read_raw(mir.dev_fd, at, 24, 900);
+		// No pacing sleep: back to back is the point. The command's own settle
+		// time is the cadence, and anything added here opens a gap.
+		mirror_seek(mir.dev_fd, at);
 
-		sleep_ms(slot - (clock_ms() - t0));
+		// Spindle surge. A raw read spins the drive up hard; letting it fall
+		// back gives the rising and falling whine of a mechanism labouring
+		// rather than a level tone. Failure is fine -- we want the spin-up, not
+		// the bytes.
+		if (surge && !(grime_rng() % 6)) mirror_read_raw(mir.dev_fd, at, 24, 700);
 	}
+
+	// SEEK stops audio playback outright (verified: PLAYING -> DONE), so hand
+	// the spindle back to a true 1x before the mirror carries on.
+	grime_resume(to_lba);
 }
 
 // A worn mechanism does not slip once and recover neatly. It slips, grabs,
@@ -808,6 +821,7 @@ static void grime_hunt(int lba, double reach_mm, int reps)
 		sleep_ms(14 + (grime_rng() % 46));
 	}
 	grime_aim(lba);           // finally settles where it was supposed to be
+	grime_resume(lba);
 }
 
 // A gesture carries how long the original mechanism would have taken. The USB
