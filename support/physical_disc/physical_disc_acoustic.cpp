@@ -678,11 +678,12 @@ static unsigned grime_rng(void)
 	return s;
 }
 
+// 0..11. Ten is a mechanism well past its best. Eleven is one louder.
 static int grime_level(void)
 {
 	int g = cfg.physical_disc_acoustic_grime;
 	if (g < 0)  g = 0;
-	if (g > 10) g = 10;
+	if (g > 11) g = 11;
 	return g;
 }
 
@@ -725,6 +726,13 @@ static void grime_hunt(int lba, double reach_mm, int reps)
 
 	reach_mm *= 0.4 + g / 5.0;
 	reps     += g / 3;
+
+	// Past ten there is nowhere left to go on frequency -- it already fires on
+	// everything -- so eleven buys magnitude instead: it wanders nearly twice
+	// as far and takes several more attempts to find its way back. Expect the
+	// mirror to fall behind the game and resync, which is itself what a drive
+	// this far gone does.
+	if (g > 10) { reach_mm *= 1.8; reps += 3; }
 
 	for (int i = 0; i < reps; i++) {
 		if (!mir.on || mir.held || mir.phys_session || mir.dev_fd < 0) break;

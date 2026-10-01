@@ -212,6 +212,15 @@ Grime adds that back, scaled by level:
 | end of a long seek | dry sled overshoots and corrects |
 | spin-up | hazy lens takes several goes to focus |
 
+The dial runs 0..11. Ten is a mechanism well past its best. **Eleven is one
+louder**: frequency has nowhere left to go at ten, since it already fires on
+everything, so eleven buys magnitude -- it wanders nearly twice as far and takes
+several more attempts to find its way back. Measured consequence: a stream
+gesture nominally lasting 240 ms takes 2 to 8 seconds, so the mirror stops
+tracking the game in any timely way and simply thrashes. That is the point of
+eleven, but 9-10 is the ceiling if you want it filthy AND still following the
+game.
+
 This is **the one part of the engine that invents activity the original would
 not have had on a good day**, which is why it is opt-in and why it lives in the
 player rather than in the model — the model stays an honest description of a
