@@ -177,6 +177,31 @@ Note `sleep_ms` clamps at 500 ms (deliberately, to stay responsive to on/held), 
 the remainder hold has to use `sleep_long_ms` -- it was silently truncating a 714 ms
 pad and leaving the end of a seek silent.
 
+### The jitter was never the seeks
+
+Report: *"maybe one 1.5 second long travel but otherwise just little skittish
+jitters and 0.25 second travels"*.
+
+Measured over 260 s of play there were only **sixteen** head movements, nearly all
+29-32 mm, with a 95 s gap between clusters. So the seeks could not have been the
+skittishness. The clue was "0.25 second": a STREAM gesture is 250 ms, and the
+data-read branch was issuing a `mirror_play` on **every** one of them -- four a
+second, each re-acquiring the audio servo -- even though the modelled head movement
+was 0.000 mm.
+
+"Quiet" has to mean issuing nothing. It now re-aims only when the head is actually
+somewhere else, which is the test the audio branch already used:
+
+```
+re-aims in ~150 s : 18      (was ~4 per second, about 600)
+STREAM gestures   : 472     so 454 of them issue nothing at all
+drags             : 1971ms -> 2026, 1923 -> 1959, 1971 -> 1987, 1865 -> 2041
+```
+
+Lesson worth keeping: a command that moves the head 0 mm is not silent. Every PLAY
+re-establishes the audio servo and is audible. Count commands issued, not millimetres
+modelled.
+
 ### On the sources
 
 Genesis Plus GX's author says its CDD latency model is *"not accurate to how the

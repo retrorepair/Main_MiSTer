@@ -1175,7 +1175,26 @@ static void play_gesture(const gesture_t *g)
 				// hunting in place -- audibly a laser that cannot track. The
 				// sound of a load is the TRAVERSES, which sled_sweep now makes
 				// continuous; between them the mechanism is entitled to be quiet.
-				mirror_play(mir.dev_fd, target, tail);
+				//
+				// And "quiet" has to mean ISSUING NOTHING. This was still firing
+				// a PLAY every gesture -- four a second, every one of them
+				// re-acquiring the audio servo -- which is heard as a constant
+				// skittishness and as "0.25 second travels", 250 ms being
+				// exactly the gesture period. Measured over 260 s of play there
+				// were only sixteen real head movements, nearly all of them
+				// 29-32 mm, with a 95 s gap between clusters: the seeks were
+				// never the noise. This was.
+				//
+				// So re-aim only when the head is actually somewhere else, the
+				// same test the audio branch already used.
+				int pos = 0, playing = 0;
+				if (mirror_subq(mir.dev_fd, &pos, &playing)) { playing = 0; pos = -1; }
+				int drift = (pos < 0) ? INT_MAX
+				          : (pos > target ? pos - target : target - pos);
+				if (!playing || drift > 400) {
+					mirror_play(mir.dev_fd, target, tail);
+					acu_log("  re-aim: playing=%d drift=%d\n", playing, drift);
+				}
 				if (grime_level() >= 9 && !(grime_rng() % 12)) grime_hunt(target, 1.5, 0);
 				sleep_ms(g->dur_ms - (clock_ms() - start));
 			}
