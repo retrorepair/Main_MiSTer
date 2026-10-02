@@ -44,9 +44,15 @@
 #   that trace is cut it floats and the driver may stay muted -- which looks exactly
 #   like a wiring fault. Measure pin 20 on the running PS1 first and hold it there.
 #
-#   Logic level: those inputs were driven by the CD DSP, so they take whatever it
-#   ran at. Measure the DSP's Vcc -- 3.3 V means the Pico drives them directly, 5 V
-#   means a 74HCT buffer between (HCT accepts a 3.3 V input).
+#   Logic level: NO BUFFER NEEDED. The PU-22 board's digital rail is DIG 3.5 V and
+#   the CD DSP (IC732) runs from it, so the inputs it was driving on IC722 take
+#   3.5 V logic -- a Pico's 3.3 V output drives them directly. From the service
+#   manual block diagram, which also labels MOT +8V as a dedicated motor rail into
+#   IC722, so the 8 V arrives on its own.
+#
+#   The traces to cut are between IC732 (CD DSP) and IC722 (DRIVER). The optical
+#   block is a KSM-440AEM; of its two connectors, the one going to IC723 CD-RF is
+#   the laser flex and can be ignored entirely -- the other is the motor connector.
 
 import board
 import digitalio
