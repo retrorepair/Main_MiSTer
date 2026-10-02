@@ -884,6 +884,10 @@ static void grime_resume(int lba)
 // gestures; otherwise the engine spends its time restarting playback.
 #define PLAY_MIN_BLOCKS      4000
 
+// Below this the mirror makes no sound at all. 5 mm sits in the gap between
+// the small moves (up to 3.2 mm) and the real transitions (29-32 mm).
+#define SILENT_BELOW_MM        5.0
+
 // Drag the sled continuously from one radius to another, taking `total_ms`.
 //
 // This is what the non-blocking SEEK(10) is actually good for. Waiting for each
@@ -942,7 +946,14 @@ static void grime_grind(int from_lba, int to_lba, double total_ms)
 
 	// Below the lens-jump range the sled does not move at all, so there is
 	// nothing to make noise with.
-	if (dist < 0.05) { grime_resume(to_lba); return; }
+	// Silence anything that is not a real transition. Measured mirror distances
+	// split cleanly: the transitions are 29-32 mm and everything else is 0.04-3.2 mm.
+	// Those small ones are faithful -- a Mega CD does move its sled for them -- but
+	// they are what reads as skittish, and the owner would rather have silence and
+	// then a long travel. Not even a grime_resume here: a PLAY is a command, and a
+	// command is a noise. The next transition seeks to an absolute target, so
+	// skipping these costs no accuracy in where the head ends up.
+	if (dist < SILENT_BELOW_MM) return;
 
 	// Below about half a second there is only time for one move, and a short seek
 	// played as a long one is what made a 0.6 mm hop sound identical to a cross-disc
@@ -1020,12 +1031,23 @@ static void grime_grind(int from_lba, int to_lba, double total_ms)
 	// would have had.
 	double want_v = (total_ms > 1.0) ? dist / total_ms : 0.02;   // mm per ms
 	double denom  = 1.0 - STEP_PER_MM_MS * want_v;
-	double fixed  = STEP_FIXED_MS;
 	double gone   = 0.0;
 	int    segs   = 0;
 
+	// Carry the cost estimate between drags. Starting every drag from the constant
+	// threw away what the last one measured, and the first leg is the one most
+	// likely to come out at the wrong speed.
+	static double fixed_est = STEP_FIXED_MS;
+	double fixed  = fixed_est;
+	double prev_L = 0.0;
+
 	while (gone < dist - 0.10 && segs < 12 && !mirror_aborted()) {
 		double L = (denom > 0.05) ? fixed * want_v / denom : dist;
+		// The first leg returns in about a millisecond, because the sled is not yet
+		// moving, so it measures nothing and its length is a guess. Make it a SHORT
+		// probe: the following leg then blocks for the probe's travel, which gives a
+		// fresh cost estimate before any long leg is committed to.
+		if (segs == 0 && dist > 6.0) L = 2.0;
 		if (L < 0.8) L = 0.8;
 		// Never leave a stub behind: a short final leg still pays the whole fixed
 		// cost, so it comes out at 4-6 mm/s and is heard as the drag dying away.
@@ -1044,9 +1066,14 @@ static void grime_grind(int from_lba, int to_lba, double total_ms)
 		// measurement is delayed by one -- so a high gain on it rings: 0.6 gave
 		// 27, 15, 23, 6 mm/s within a single drag.
 		if (el > 20.0) {
-			double f = el - STEP_PER_MM_MS * L;
-			if (f > 40.0 && f < 1500.0) fixed = fixed * 0.75 + f * 0.25;
+			// el is the PREVIOUS leg's travel, so attribute it to that length.
+			double f = el - STEP_PER_MM_MS * prev_L;
+			if (f > 40.0 && f < 1500.0) {
+				fixed     = fixed * 0.70 + f * 0.30;
+				fixed_est = fixed;
+			}
 		}
+		prev_L = L;
 
 		segs++;
 		if (clock_ms() - grind_start > total_ms) break;
