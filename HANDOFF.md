@@ -92,6 +92,57 @@ drag 32.3mm over 1288ms in 3 segs, whole 1314ms     LOCK 1534ms / 1491
 3–4 contiguous segments across the whole stroke, filling the duration. Running
 binary confirmed via `/proc/<pid>/exe` → `/media/fat/MiSTer_Physical-CD`.
 
+## What a Mega CD drive actually does (researched, after "gravely")
+
+Three findings, each of which contradicted something I had built.
+
+**A long seek is ONE coarse move, not a march.** The sled motor runs the pickup to
+the *estimated* position of the target track, partially open-loop for long jumps,
+after which the servo closes the loop, reads the address and corrects. Equal
+segments are a sound no drive makes: each one accelerates, decelerates and settles,
+so 2-4 across a disc is a 2-3 Hz chug. That is exactly the reported gravel.
+
+**Fine structure is not available over USB at all.** The CDD runs its command and
+status loop once per sector period -- exactly 75 Hz. The real servo therefore
+corrects about twenty times faster than anything reachable here, so imitating it at
+whatever rate the bus allows does not give a coarser version of the real sound, it
+gives a different one.
+
+**The sled is a worm gear on two rails** (Model 2 repair documentation), which is a
+continuous whirr rather than a ratchet -- and slow, which is why a real seek takes
+1.5-2 s where this 1997 Mitsumi crosses the whole disc in about 670 ms.
+
+### Consequence: two sweeps and one turnaround
+
+One sweep leaves most of the budget silent, and subdividing it is the chug. The way
+to fill the time is **distance, not subdivision**: overshoot the target and come
+back. Two continuous sweeps, one direction change, sled moving nearly throughout --
+and it is what a partially-open-loop seek does anyway, since it misses and gets
+corrected. The overshoot is sized from the leftover budget rather than a fixed
+fraction, so spare time becomes travel, and it grows for shorter seeks that would
+otherwise finish early.
+
+The lock settle and the wear hunt are single sweeps each now, for the same reason.
+
+```
+drag 29.2mm over 1339ms in 2 segs, whole 1339ms    data -> CDDA, 1.00x
+settle -1.2mm from 56.3mm                          lock correction, inward
+LOCK took 803ms / 746 modelled                     2142 ms total before the music
+drag 32.3mm over 1288ms in 2 segs, whole 1288ms    CDDA -> data, 1.00x
+SLEW 300ms / 286 modelled                          short seek: one move
+```
+
+### On the sources
+
+Genesis Plus GX's author says its CDD latency model is *"not accurate to how the
+real micro-controller and CD mechanism worked"* and that timings *"should be
+measured on real hardware"*. The 1.5 s full stroke this profile was built on is an
+emulator convenience, not a measurement -- so for an acoustic emulator the owner's
+ear is the better authority, which is why lock_revs came down on their word.
+
+There is no published Mega CD seek curve. The CDD protocol is documented (ten 4-bit
+nibbles, 75 Hz, BCD MSF addresses) but its mechanical timings are not.
+
 ## Spindle: the drive honours speed changes
 
 Settled, having been unknown all session. On the Mitsumi FX120T, raw-sector
