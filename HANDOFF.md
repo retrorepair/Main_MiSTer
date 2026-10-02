@@ -132,6 +132,51 @@ drag 32.3mm over 1288ms in 2 segs, whole 1288ms    CDDA -> data, 1.00x
 SLEW 300ms / 286 modelled                          short seek: one move
 ```
 
+### The CDD command set settles where the noise belongs
+
+From the MegaSD reverse-engineering notes (gendev.spritesmind.net/page-megasd.html),
+the most complete account of the CDD there is:
+
+* **Command 0x03 READ/PLAY** is *"SEEK to start position THEN Play music / Read
+  data"* -- one command, status going to PLAY straight away. There is no long lock
+  phase between the seek and the music, so a quiet LOCK gesture sitting in that gap
+  was a fiction of this model. It is now 1 revolution, 249 ms.
+* **Error 0x03 E-FOCUS**: *"Focus down for more than 100msec will retry until ok"*.
+  Locking on is FOCUS, a lens operation. It moves no carriage, so it makes no sled
+  noise, and the two versions of a sled "settle" put here were both wrong.
+* **Seek time is explicitly undefined** -- *"??seek time to be defined"* appears
+  twice. Combined with the GPGX author's own disclaimer, there is no published
+  figure anywhere, which is why the owner's ear is the authority.
+* Interrupts are *"every 1/75s (13.3ms) while data transfer is on progress"*, every
+  15.8 ms otherwise. The 75 Hz command loop is the hard ceiling on fine structure.
+
+So the noise is all in the SEEK. `full_stroke_ms` is 2400, which satisfies both of
+the owner's independent observations with one constant: the Sonic CD data-to-CDDA
+transition (0.703 of a stroke) comes to 1972 ms, *"about two seconds"*, and a true
+cross-disc seek to 2685 ms, *"three second sled drags"*.
+
+### Filling a long budget without chunking it
+
+A Mega CD fills 1.5-2 s with ONE continuous traverse because its worm-gear sled is
+roughly three times slower than this drive, which crosses the whole disc in 670 ms.
+That speed cannot be lowered. And once the target is at the rim -- where a CDDA
+track is -- there is no more single-direction ground to cover.
+
+So the budget is spent on the main traverse plus as many out-and-back pairs as it
+affords, each leg at least 8 mm so it reads as a sweep and not as one of the equal
+little steps that got called gravely. If there is no room for a proper leg it stops
+and holds the slot, because a short jerk is worse than nothing.
+
+```
+drag 29.2mm over 1971ms in 3 segs, whole 1982ms    1.01x, ~59 mm of travel
+LOCK took 249ms / 249 modelled                     brief and quiet
+drag 32.3mm over 1923ms in 3 segs, whole 1963ms    1.02x
+```
+
+Note `sleep_ms` clamps at 500 ms (deliberately, to stay responsive to on/held), so
+the remainder hold has to use `sleep_long_ms` -- it was silently truncating a 714 ms
+pad and leaving the end of a seek silent.
+
 ### On the sources
 
 Genesis Plus GX's author says its CDD latency model is *"not accurate to how the

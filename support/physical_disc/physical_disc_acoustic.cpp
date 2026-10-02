@@ -932,25 +932,46 @@ static void grime_grind(int from_lba, int to_lba, double total_ms)
 	// the ESTIMATED position of the target track, so it misses and the servo corrects
 	// -- the overshoot is the miss. Sizing it from the leftover budget rather than a
 	// fixed fraction means the time gets spent on travel instead of waiting.
-	double direct = 2.0 * STEP_FIXED_MS + STEP_PER_MM_MS * dist;
-	double spare  = total_ms - RESUME_PLAY_MS - direct;
-	double over   = (spare > 0.0) ? spare / (2.0 * STEP_PER_MM_MS) : 0.0;
-	if (over > 12.0) over = 12.0;
+	// Spend the budget on TRAVEL, never on silence, and only in long legs.
+	//
+	// A Mega CD fills 1.5-2 s with one continuous traverse because its worm-gear
+	// sled is about three times slower than this one, which crosses the whole disc
+	// in 670 ms. That speed cannot be lowered, so the only way to keep the sled
+	// moving for the modelled duration is to cover more ground -- and once the
+	// target is at the rim, as a CDDA track is, more ground means a reversal.
+	//
+	// So: the main traverse, then as many out-and-back pairs as the budget affords,
+	// each leg at least MIN_LEG_MM so it reads as a sweep rather than one of the
+	// equal little steps that got called gravely. If there is not room for a proper
+	// leg, stop: a short jerk is worse than nothing.
+	//
+	// It is also roughly what a miss looks like. A long jump runs partially
+	// open-loop to the estimated position, so the servo has to come back and verify.
+	#define MIN_LEG_MM  8.0
+	#define MAX_LEG_MM 16.0
 
-	if (grime_level() >= 4 && over > 0.3) {
-		sled_sweep(r1 + (span > 0 ? over : -over));
-		sled_sweep(r1);
-	}
-	else {
+	double budget = total_ms - RESUME_PLAY_MS;
+	double dir    = (span > 0) ? 1.0 : -1.0;
+
+	sled_sweep(r1);
+
+	for (int leg = 0; leg < 3 && grime_level() >= 4 && !mirror_aborted(); leg++) {
+		double left = budget - (clock_ms() - grind_start);
+		// An extra pair costs two fixed costs plus the travel of both legs.
+		double x = (left - 2.0 * STEP_FIXED_MS) / (2.0 * STEP_PER_MM_MS);
+		if (x < MIN_LEG_MM) break;
+		if (x > MAX_LEG_MM) x = MAX_LEG_MM;
+		sled_sweep(r1 - dir * x);
 		sled_sweep(r1);
 	}
 
 	// SEEK leaves audio playback stopped, so hand the spindle back to a true 1x.
 	grime_resume(to_lba);
 
-	// If the drive beat the budget, hold the rest of the slot: the gesture's
-	// duration is what the game's timing is built on, short as well as long.
-	sleep_ms(total_ms - (clock_ms() - grind_start));
+	// Whatever is left after the legs: hold the slot so the rhythm is right.
+	// sleep_long_ms, because sleep_ms clamps at 500 ms and was silently
+	// truncating a 714 ms remainder.
+	sleep_long_ms(total_ms - (clock_ms() - grind_start));
 
 	acu_log("  drag %.1fmm over %.0fms in %d segs, whole %.0fms\n",
 	        dist, total_ms, g_drag_segs, clock_ms() - grind_start);
@@ -1232,26 +1253,18 @@ static void play_gesture(const gesture_t *g)
 			// and forth in one place is the sound of a drive that cannot track.
 			grime_resume(target);
 
-			if (grime_level() && !mir.phys_session && mir.dev_fd >= 0) {
-				double here = media_radius_mm(target);
-				double off  = 0.4 + 0.12 * grime_level();
-				// Settle INWARD when there is no room outward. A CDDA track sits
-				// toward the outside, and with a gain applied the jump to it
-				// saturates and parks the head at the rim -- where an outward
-				// excursion clamps and the settle would be silent, in exactly the
-				// case this exists for.
-				if (here + off > mir.r_hi) off = -off;
-				// Two moves, not two drags. This is the servo closing the loop and
-				// verifying the address, which is a short correction -- four chunks
-				// here was part of what sounded gravely.
-				double cost = 2.0 * (STEP_FIXED_MS + STEP_PER_MM_MS * (off < 0 ? -off : off));
-				if (cost < g->dur_ms) {
-					sled_sweep(here + off);
-					sled_sweep(here);
-					grime_resume(target);
-					acu_log("  settle %+.1fmm from %.1fmm\n", off, here);
-				}
-			}
+			// No sled movement here. Locking on is FOCUS, which is the lens: the
+			// CDD's own error table has 0x03 E-FOCUS retrying "until ok" when focus
+			// is down for more than 100 ms, and none of that moves the carriage. And
+			// command 0x03 READ/PLAY is "SEEK to start position THEN Play music", one
+			// command whose status goes to PLAY immediately, so there is no long lock
+			// phase between the seek and the music in the first place.
+			//
+			// Two earlier versions put the sled to work here -- first a drag out and
+			// back, then a single correction -- to cover a 1.5 s silence between the
+			// sweep and the music. The silence was the real bug: the seek was too
+			// short. It is in the seek now (full_stroke 2400), and this is brief and
+			// quiet, as the hardware is.
 			sleep_ms(g->dur_ms - (clock_ms() - start));
 			break;
 		}

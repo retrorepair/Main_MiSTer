@@ -43,11 +43,29 @@ static const acu_drive_t drives[PD_ACU_PROFILE_COUNT] = {
 	// base 160 ms and stroke 1500 ms are Genesis Plus GX's documented figures
 	// (2 + 10 interrupts base; "max. seek time = 1.5 s" across 270000 sectors),
 	// which the MiSTer core's own latency model matches. Measured, not guessed.
-	// lock_revs is 3, not 6, from the owner's ear on real hardware: the whole
-	// audible event before a CDDA track starts runs about two seconds. The seek
-	// is 1.34 s of that, so six revolutions (1.49 s at the 241 rpm of a 1x outer
-	// edge) made it 2.8 s. Three puts it at roughly 2.1 s.
-	{ "MegaCD",    1.0, 1.0,  24,  480,   55,   160,  1500,  2200, 6000,  4, 1,   3 },
+	// full_stroke 2400 and lock_revs 1, and the noise lives in the SEEK.
+	//
+	// Genesis Plus GX's 1.5 s is where this started, but its own author says that
+	// latency model is "not accurate to how the real micro-controller and CD
+	// mechanism worked" and that timings "should be measured on real hardware".
+	// The MegaSD reverse-engineering notes, which are the most complete account of
+	// the CDD there is, leave seek time explicitly undefined ("??seek time to be
+	// defined"). So there is no published figure to defer to, and the owner's ear
+	// on a real Mega CD is the best source available.
+	//
+	// 2400 satisfies both of their independent observations with one constant: the
+	// Sonic CD data-to-CDDA transition, 0.703 of a stroke, comes to 1972 ms
+	// ("about two seconds"), and a true cross-disc seek to 2685 ms ("three second
+	// sled drags").
+	//
+	// lock_revs is 1 because CDD command 0x03 is READ/PLAY -- "SEEK to start
+	// position THEN Play music / Read data" -- one command, with the status going
+	// to PLAY straight away. There is no long separate lock phase to fill: a
+	// lengthy quiet LOCK between the sweep and the music was heard as the seek
+	// firing at the wrong moment. What locking there is, is FOCUS, a lens
+	// operation (error 0x03 E-FOCUS retries if focus is down over 100 ms), so it
+	// moves no sled and makes no noise.
+	{ "MegaCD",    1.0, 1.0,  24,  480,   55,   160,  2400,  2200, 6000,  4, 1,   1 },
 	// Saturn: 2x data / 1x audio. SOURCED -- an earlier note here claimed there
 	// was no citable seek model for this drive, which was wrong. Mednafen's CD
 	// block has one, in ss/cdb.cpp DRIVEPHASE_SEEK_START3:
