@@ -33,6 +33,63 @@ the part anyone recognises, was silence. A Mega CD loading is a repeating cadenc
 re-locks, repeat). A data `STREAM` gesture now makes one real synchronised move,
 alternating around the target — 4 Hz at the 250 ms gesture length.
 
+## Correction: the cadence was wrong, and so was "weak"
+
+Feedback on the first fix: *"not grimy, just weak and shitty like the laser is
+broken"*. Both halves of that were accurate.
+
+The data-read cadence oscillated the sled 0.35 mm each way at 4 Hz, on my own
+theory that a load is the CDC's buffer-fill rhythm. A real sled advances
+**monotonically** through a read, and a small movement repeated back and forth in
+one place is exactly what a drive does when it cannot hold the track. Removed,
+along with the matching nudge during CDDA.
+
+"Weak" was structural. A synchronised seek gives ~50 ms of travel then 300-700 ms
+of waiting, and in service the budget only bought one or two, so a cross-disc seek
+was a short jerk, a long silence and a reversal.
+
+### Seeks are now ONE CONTINUOUS DRAG
+
+`sled_drag()` re-aims repeatedly along the path with **bare** seeks and no sleep.
+The drive takes one move at a time, so the next SEEK blocks until the current
+finishes and the sled never stops -- the drive's own serialisation is the clock.
+192 ms for a 0.7 mm step issued this way, against 300-700 ms through
+`mirror_seek_sync`, whose sub-channel read is pure overhead.
+
+Sleeping between the re-aims (the first attempt) added the budget on top of that
+serialisation and overran 5x -- a 1339 ms seek took 6881 ms. Removing the sleep
+brought it to 1339 ms exactly.
+
+Short seeks do not wait at all: one bare SEEK moves the sled just as far and
+returns at once, then the slot is held. That took a 286 ms gesture from 1154 ms
+back to 287 ms.
+
+### Gain was off
+
+`PHYSICAL_DISC_ACOUSTIC_GAIN=1` means **no amplification** -- every move is only as
+big as the game's own geometry, about a third of the stroke. At 2 a transition
+becomes a full 32.3 mm traverse. At 3 it saturates: the trace pinned at both clamps
+(LBA -13 and 309568) and the head parked at the rim, where further outward moves do
+nothing. Set to 2; original ini saved as `/media/fat/MiSTer.ini.preacoustic`.
+
+### Measured, final
+
+```
+drag 32.3mm over 1125ms in 3 segs, whole 1125ms     SLEW  287ms / 286 modelled
+drag 29.2mm over 1339ms in 4 segs, whole 1550ms     SLEW 1314ms / 1288
+drag 32.3mm over 1288ms in 3 segs, whole 1314ms     LOCK 1534ms / 1491
+```
+
+3-4 contiguous segments across the whole stroke, filling the duration.
+
+### Note on instrumentation
+
+`headtrace.py` reports a drag as ONE hop of 24 mm between consecutive samples,
+which would be impossible sled speed. With several seeks queued the sub-channel
+reports the **commanded** position, not the actual one, so it cannot resolve a
+drag's interior. The elapsed time in `/tmp/acoustic.log` is the reliable evidence:
+n blocking seeks taking 1288 ms means the drive was in motion for 1288 ms.
+
 ## Verified end state
 
 Measured externally with `headtrace.py`, same tool and game as the baseline:
