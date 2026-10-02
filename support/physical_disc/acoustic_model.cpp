@@ -43,7 +43,11 @@ static const acu_drive_t drives[PD_ACU_PROFILE_COUNT] = {
 	// base 160 ms and stroke 1500 ms are Genesis Plus GX's documented figures
 	// (2 + 10 interrupts base; "max. seek time = 1.5 s" across 270000 sectors),
 	// which the MiSTer core's own latency model matches. Measured, not guessed.
-	{ "MegaCD",    1.0, 1.0,  24,  480,   55,   160,  1500,  2200, 6000,  4, 1,   6 },
+	// lock_revs is 3, not 6, from the owner's ear on real hardware: the whole
+	// audible event before a CDDA track starts runs about two seconds. The seek
+	// is 1.34 s of that, so six revolutions (1.49 s at the 241 rpm of a 1x outer
+	// edge) made it 2.8 s. Three puts it at roughly 2.1 s.
+	{ "MegaCD",    1.0, 1.0,  24,  480,   55,   160,  1500,  2200, 6000,  4, 1,   3 },
 	// Saturn: 2x data / 1x audio. SOURCED -- an earlier note here claimed there
 	// was no citable seek model for this drive, which was wrong. Mednafen's CD
 	// block has one, in ss/cdb.cpp DRIVEPHASE_SEEK_START3:

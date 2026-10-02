@@ -837,7 +837,13 @@ static void grime_resume(int lba)
 // grind's own tail showed it plainly: the overshoot-and-return pair, two moves of
 // 3.5 mm, took 830 and 1369 ms where the bench curve predicted 412. Budgeting
 // against bench figures is what left a long seek 35-50% over its duration.
-#define STEP_FIXED_MS        180.0
+// 340, not 180: a seek issued while the sled is already moving costs MORE than an
+// isolated one, because the drive has to decelerate, re-plan and accelerate again.
+// Measured from the drags themselves -- 29.2 mm in 4 segments took 1958 ms, so
+// 490 ms for a 7.3 mm segment against the 297 ms an isolated-seek curve predicts.
+// The 180 ms figure was for 0.7 mm steps, where the fixed part dominates and the
+// re-plan is cheap. Budgeting with it put a 1339 ms seek at 1958 ms.
+#define STEP_FIXED_MS        340.0
 #define STEP_PER_MM_MS        16.0
 #define DRIVE_MIN_SEEK_MS    300.0
 
@@ -1235,31 +1241,41 @@ static void play_gesture(const gesture_t *g)
 		}
 
 		case GEST_LOCK: {
-			// Arrived at the track, spun up, not playing yet. The disc turns
-			// several times while the servo settles and acquires the subcode,
-			// and a Mega CD makes that unmistakably audible before the music
-			// starts. So: spindle to a true 1x at the track start, then let it
-			// turn for the modelled number of revolutions, with the occasional
-			// correction a real servo makes while it is locking on.
+			// Arrived at the track, spun up, not playing yet -- and on a Mega CD
+			// this is the SECOND HALF of the noise you hear before a CDDA track,
+			// not a pause. It used to move the sled 0.000 mm: a trace of a track
+			// change showed 1550 ms of drag, then 1534 ms of complete silence, then
+			// the music. That is why the long seek sounded like it fired at the
+			// wrong moment -- it fired at the right one and then stopped a second
+			// and a half early.
+			//
+			// So settle onto the track audibly: step off it, then ease back on over
+			// most of the lock, so the sled is still working when the music starts.
+			// One reversal and a slow monotonic approach, which is a servo pulling
+			// in -- deliberately NOT a hunt, because small movements repeated back
+			// and forth in one place is the sound of a drive that cannot track.
 			grime_resume(target);
-			double until = start + g->dur_ms;
-			// A correction is two synchronised seeks and a PLAY, so it needs
-			// most of half a second. The loop used to test only the deadline
-			// before starting one, which was harmless while a seek cost 1 ms and
-			// overran by 59% once seeks began to wait: do not start what will not
-			// fit.
-			const double fidget_ms = 2.0 * (STEP_FIXED_MS + STEP_PER_MM_MS * 0.12)
-			                       + RESUME_PLAY_MS;
-			while (clock_ms() < until) {
-				if (!mir.on || mir.held || mir.phys_session || mir.dev_fd < 0) break;
-				sleep_ms(90);
-				if (grime_level() && !(grime_rng() % 4)
-				    && until - clock_ms() >= fidget_ms) {
-					mirror_seek_sync(mir.dev_fd, lba_offset_mm(target, 0.12));
-					mirror_seek_sync(mir.dev_fd, target);
+
+			if (grime_level() && !mir.phys_session && mir.dev_fd >= 0) {
+				double here = media_radius_mm(target);
+				double off  = 0.8 + 0.25 * grime_level();
+				// Settle INWARD when there is no room outward. A CDDA track
+				// sits toward the outside, and with a gain applied the jump to
+				// it saturates and parks the head at the rim -- where an
+				// outward excursion clamps and the settle would be silent, in
+				// exactly the case this exists for.
+				if (here + off > mir.r_hi) off = -off;
+				double away = g->dur_ms * 0.28;
+				double back = g->dur_ms * 0.62;
+				if (away + back < g->dur_ms) {
+					sled_drag(here, here + off, away);
+					sled_drag(here + off, here, back);
 					grime_resume(target);
+					acu_log("  settle %+.1fmm from %.1fmm over %.0fms\n",
+					        off, here, away + back);
 				}
 			}
+			sleep_ms(g->dur_ms - (clock_ms() - start));
 			break;
 		}
 
