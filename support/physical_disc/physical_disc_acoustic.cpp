@@ -868,6 +868,8 @@ static void grime_resume(int lba)
 //
 // Monotonic on purpose. A real sled runs one way across a seek; oscillating back
 // and forth in one place is what a drive does when it cannot track.
+static int g_drag_segs;
+
 static void sled_drag(double r_from, double r_to, double total_ms)
 {
 	double dist = r_to > r_from ? r_to - r_from : r_from - r_to;
@@ -888,6 +890,7 @@ static void sled_drag(double r_from, double r_to, double total_ms)
 	if (n < 1) n = 1;
 	if (n > 40) n = 40;
 
+	g_drag_segs      = n;
 	double start     = clock_ms();
 	double step_cost = STEP_FIXED_MS + STEP_PER_MM_MS * (dist / n);
 
@@ -965,8 +968,8 @@ static void grime_grind(int from_lba, int to_lba, double total_ms)
 	// duration is what the game's timing is built on, short as well as long.
 	sleep_ms(total_ms - (clock_ms() - grind_start));
 
-	acu_log("  drag %.1fmm over %.0fms, whole %.0fms\n",
-	        dist, total_ms, clock_ms() - grind_start);
+	acu_log("  drag %.1fmm over %.0fms in %d segs, whole %.0fms\n",
+	        dist, total_ms, g_drag_segs, clock_ms() - grind_start);
 }
 
 // A worn mechanism does not slip once and recover neatly. It slips, grabs,
