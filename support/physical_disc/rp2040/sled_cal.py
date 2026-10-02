@@ -1,35 +1,37 @@
 # sled_cal.py -- characterise a CD sled for acoustic mirroring
 #
-# MicroPython for RP2040. Copy to the Pico as main.py (or paste at the REPL) and
-# call the functions below. MicroPython rather than the C SDK on purpose: this is a
-# measuring tool, not the final firmware, and drag-and-drop beats a toolchain.
+# MicroPython for RP2040. Copy to the Pico (as main.py, or paste at the REPL).
+# MicroPython rather than the C SDK on purpose: this is a measuring instrument, not
+# the final firmware, and drag-and-drop beats standing up a toolchain.
 #
 # The question it exists to answer: does the sled run SMOOTHLY at 16-21 mm/s, which
 # is a Mega CD's sled velocity, or does static friction stall it first? Everything
 # else depends on that answer, so measure it before building any more.
 #
 #
-# HOW IT MEASURES, given only ONE switch
+# THE METHOD
 #
-#   The inner limit switch is the only position feedback. So only INWARD runs can
-#   tell us they have arrived -- an outward run has nothing to stop it, and driving
-#   outward "until it gets there" just stalls against the end stop.
+#   The inner limit switch is the only position feedback, so only INWARD runs can
+#   tell us they have arrived. Every measurement is therefore:
 #
-#   So nothing here ever drives to the outer end. Instead:
+#       sled at the OUTER stop  ->  drive inward at duty D  ->  switch closes
 #
-#     1. home                       -- inward until the switch asserts. Known origin.
-#     2. a REFERENCE pulse outward  -- fixed duty, fixed short time. The sled ends up
-#                                      somewhere mid-rail. We do not know where in mm,
-#                                      but it is the SAME place every single time.
-#     3. time an inward run at the  -- ends on the switch, so it self-terminates.
-#        duty under test
+#   The outer stop is a hard mechanical reference, so the distance is the full
+#   stroke every time and the only variable is D. Wind it out by hand if you can
+#   reach the worm -- nothing stalls that way -- or use out_to_stop().
 #
-#   Step 2 is identical for every measurement, so the distance is a constant and the
-#   inward time is purely a function of the test duty. One ruler measurement turns
-#   that into mm/s: see ref_measure() below, which you run ONCE.
+#   PWM duty does NOT tell you velocity: that relationship is what we are measuring,
+#   and it depends on the motor, the gearing and the friction. So ONE physical
+#   measurement is needed, of the full stroke in mm. stroke_measure() walks through
+#   it. Being a ~34 mm measurement rather than a few mm, a steel rule is plenty.
 #
-#   Nothing stalls except momentarily at the inner switch, which is the condition
-#   every CD player homes into by design.
+#   Results accumulate in /sled_cal.csv and survive a power cycle, so runs can be
+#   done one at a time with winding in between. table() prints what you have.
+#
+#   Getting the file onto a PC: MicroPython does not expose its filesystem as a USB
+#   drive (the mass-storage device you see is the UF2 bootloader, which cannot read
+#   the Python filesystem). Either copy table()'s output off the REPL, or pull the
+#   real file with:   mpremote fs cp :sled_cal.csv .
 #
 #
 # WIRING -- read before powering anything
@@ -47,7 +49,7 @@
 #   specifically: its TTL thresholds accept a 3.3 V input.
 
 from machine import Pin, PWM
-import time
+import time, json, os
 
 # ---------------------------------------------------------------- configuration
 
@@ -65,17 +67,8 @@ LIMIT_ACTIVE_LOW = True      # most are: closed to ground when the sled is home
 PWM_HZ        = 25000        # above the driver's internal filter corner, and above
                              # hearing, so the PWM is not itself part of the noise
 
-# The reference outward pulse. Keep it SHORT -- short enough that the sled cannot
-# reach the outer end even at full speed. A full stroke is roughly 34 mm and the
-# fastest sleds manage about 48 mm/s, so 400 ms moves at most ~19 mm. Verify by eye
-# the first time: it must stop well clear of the end.
-REF_DUTY      = 0.50
-REF_MS        = 400
-
-# Set this from ref_measure(). Until then velocities print as "set REF_MM".
-REF_MM        = None
-
-MAX_RUN_MS    = 6000         # hard cap on any single motor run
+MAX_RUN_MS    = 8000         # hard cap on any single motor run
+STATE         = "/sled_cal.csv"
 TARGET_LO, TARGET_HI = 16.0, 21.0    # a Mega CD's sled, mm/s
 
 # ---------------------------------------------------------------------- hardware
@@ -125,13 +118,49 @@ def sw():
     return (v == 0) if LIMIT_ACTIVE_LOW else (v == 1)
 
 
+# ------------------------------------------------------------------- persistence
+
+def _load():
+    """Returns (stroke_mm_or_None, [(duty, ms), ...]) from flash."""
+    stroke, rows = None, []
+    try:
+        with open(STATE) as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                k, _, v = line.partition(",")
+                if k == "stroke":
+                    stroke = float(v)
+                elif k == "run":
+                    d, _, ms = v.partition(",")
+                    rows.append((float(d), int(ms)))
+    except OSError:
+        pass
+    return stroke, rows
+
+
+def _append(line):
+    with open(STATE, "a") as f:
+        f.write(line + "\n")
+
+
+def clear():
+    """Throw away the accumulated table and the stroke measurement."""
+    try:
+        os.remove(STATE)
+        print("cleared %s" % STATE)
+    except OSError:
+        print("nothing to clear")
+
+
 # ------------------------------------------------------------------- primitives
 
 def home(duty=0.45, timeout_ms=MAX_RUN_MS):
-    """Inward until the switch asserts. Returns ms taken, or None on timeout.
+    """Inward until the switch closes. Returns ms taken, or None on timeout.
 
-    The motor is cut the instant the switch reads closed, so it rests against the
-    inner stop without being driven into it.
+    The motor is cut the instant the switch reads closed, so the sled rests against
+    the inner stop rather than being driven into it.
     """
     if sw():
         return 0
@@ -140,8 +169,9 @@ def home(duty=0.45, timeout_ms=MAX_RUN_MS):
         _drive(_sled, duty, outward=False)
         while not sw():
             if time.ticks_diff(time.ticks_ms(), t0) > timeout_ms:
-                print("home: TIMEOUT. The switch never closed. Check LIMIT_ACTIVE_LOW,")
-                print("      the switch wiring, and whether 'inward' is really inward.")
+                print("home: TIMEOUT, the switch never closed.")
+                print("      Check LIMIT_ACTIVE_LOW, the switch wiring, and whether")
+                print("      'inward' is really inward. Or the duty is below stall.")
                 return None
             time.sleep_ms(1)
         return time.ticks_diff(time.ticks_ms(), t0)
@@ -149,22 +179,29 @@ def home(duty=0.45, timeout_ms=MAX_RUN_MS):
         stop()
 
 
-def ref_pulse():
-    """The fixed outward hop. Same duty, same time, so the same distance every run."""
+def out(duty=0.40, ms=300):
+    """One bounded outward hop. For walking the sled out in steps, watching it."""
     try:
-        _drive(_sled, REF_DUTY, outward=True)
-        time.sleep_ms(min(REF_MS, MAX_RUN_MS))
-    finally:
-        stop()
-
-
-def pulse(duty=0.5, ms=500, outward=True):
-    """Drive briefly. For poking at it by hand and for ref_measure()."""
-    try:
-        _drive(_sled, duty, outward)
+        _drive(_sled, duty, outward=True)
         time.sleep_ms(min(ms, MAX_RUN_MS))
     finally:
         stop()
+
+
+def out_to_stop(duty=0.35, ms=4000):
+    """Drive outward until it reaches the stop, then stall there for the remainder.
+
+    Only if you cannot reach the worm to wind by hand. Keep `ms` just long enough:
+    the motor is stalled for whatever time is left over. Low duty keeps that mild,
+    and it is the same condition every CD player homes into at its inner stop.
+    """
+    print("driving out at duty %.2f for %d ms (will stall briefly at the end)" % (duty, ms))
+    try:
+        _drive(_sled, duty, outward=True)
+        time.sleep_ms(min(ms, MAX_RUN_MS))
+    finally:
+        stop()
+    print("at the outer stop (assuming ms was long enough -- check by eye once)")
 
 
 def spin(duty=0.4, ms=2000):
@@ -176,156 +213,172 @@ def spin(duty=0.4, ms=2000):
         stop()
 
 
-# ----------------------------------------------------------- the one measurement
+# ------------------------------------------------------------------- measurement
 
-def ref_measure():
-    """Run ONCE, with a ruler. Establishes how far the reference pulse travels.
+def stroke_measure():
+    """Run ONCE, with a rule. The single measurement the Pico cannot make itself.
 
-    Everything else is timing, which the Pico does. This is the single step that
-    turns those times into millimetres, and it needs your eyes.
+    Everything else here is timing. This is what turns those times into millimetres.
     """
-    print("Homing...")
+    print("1. Get the sled to the OUTER end -- wind it by hand, or out_to_stop().")
+    input("   press Enter when it is there... ")
+    print()
+    print("2. Pick a fixed datum on the chassis (an edge, a screw head) and note")
+    print("   where the centre of the lens sits against it.")
+    input("   press Enter when noted... ")
+    print()
+    print("3. Homing...")
     if home() is None:
         return
+    print("   at the inner stop. Measure against the same datum.")
     print()
-    print("The sled is now at the inner stop.")
-    print("MEASURE AND NOTE: pick a fixed datum on the chassis -- an edge, a screw --")
-    print("and note where the centre of the lens sits against it. Calipers are ideal,")
-    print("a steel rule is enough: you need about 1 mm accuracy over ~15-20 mm.")
+    v = input("   full stroke, in mm (blank to abort): ").strip()
+    if not v:
+        print("   aborted")
+        return
+    try:
+        mm = float(v)
+    except ValueError:
+        print("   not a number")
+        return
+    if mm < 5.0 or mm > 60.0:
+        print("   %.1f mm is implausible for a CD sled (expect roughly 30-40)" % mm)
+        return
+    _append("stroke,%.2f" % mm)
+    print("   stored: stroke = %.1f mm" % mm)
     print()
-    input("press Enter when you have noted the starting position... ")
-    ref_pulse()
-    print()
-    print("Pulse done (%.2f duty for %d ms)." % (REF_DUTY, REF_MS))
-    print("MEASURE AGAIN against the same datum.")
-    print()
-    print("Check first: is the sled clear of the OUTER end? If it ran into the stop,")
-    print("lower REF_MS until it does not -- the whole method depends on this pulse")
-    print("landing mid-rail rather than against a stop.")
-    print()
-    print("Then set the difference at the top of this file:   REF_MM = <mm moved>")
-    print("and re-copy it, or just assign it live:            sled_cal.REF_MM = 17.5")
+    print("Now, for each duty: get the sled to the outer end, then run(<duty>).")
+    print("Try 0.25, 0.30, 0.35, 0.40, 0.50, 0.60, 0.75, 1.00.")
 
 
-def run_time(duty, settle_ms=250):
-    """Home, hop out by the reference distance, then time an inward run at `duty`.
+def run(duty):
+    """Time one full inward stroke at `duty`, and append it to the table.
 
-    Returns (ms, mm_per_s), with mm_per_s None until REF_MM is set.
+    The sled must be AT THE OUTER STOP before calling this -- that is what makes
+    the distance the same every time.
     """
-    if home() is None:
-        return (None, None)
-    time.sleep_ms(settle_ms)
-    ref_pulse()
-    time.sleep_ms(settle_ms)
     if sw():
-        print("run_time: still at the limit after the reference pulse -- it moved")
-        print("          nothing, or 'outward' is inverted.")
-        return (None, None)
+        print("run: the sled is at the INNER limit. Wind it out to the outer stop")
+        print("     first (or out_to_stop()), otherwise there is nothing to time.")
+        return None
+    stroke, rows = _load()
     ms = home(duty)
     if ms is None:
-        return (None, None)
-    v = (REF_MM * 1000.0 / ms) if REF_MM else None
-    return (ms, v)
-
-
-def cal(duties=(0.25, 0.30, 0.35, 0.40, 0.50, 0.60, 0.75, 1.00)):
-    """The table. One row per duty: time for the reference distance, and velocity.
-
-    Run ref_measure() first, or the velocity column cannot be filled in and you get
-    times only -- still useful for finding the stall threshold, just not in mm/s.
-    """
-    if REF_MM:
-        print("reference distance %.1f mm, target %.0f-%.0f mm/s (a Mega CD)\n"
-              % (REF_MM, TARGET_LO, TARGET_HI))
-        print("  duty    time     velocity   verdict")
-        print("  ----  -------  ----------   -------")
+        print("run: duty %.2f did not reach the switch -- stalled, or too slow." % duty)
+        _append("run,%.2f,0" % duty)
+        return None
+    _append("run,%.2f,%d" % (duty, ms))
+    if stroke:
+        v = stroke * 1000.0 / ms
+        print("duty %.2f: %d ms over %.1f mm = %.1f mm/s" % (duty, ms, stroke, v))
+        if TARGET_LO <= v <= TARGET_HI:
+            print("  *** IN RANGE for a Mega CD ***")
     else:
-        print("REF_MM is not set, so velocities are unknown -- run ref_measure().")
-        print("Times alone still show where it stalls.\n")
-        print("  duty    time")
-        print("  ----  -------")
+        print("duty %.2f: %d ms  (run stroke_measure() to get mm/s)" % (duty, ms))
+    # Same duty twice with very different times means the starting point moved.
+    same = [r[1] for r in rows if abs(r[0] - duty) < 0.001 and r[1] > 0]
+    if same:
+        prev = sum(same) / len(same)
+        if ms > prev * 1.25 or ms < prev * 0.8:
+            print("  NOTE: %d ms against %.0f ms previously at this duty -- the sled"
+                  % (ms, prev))
+            print("        probably did not start from the same place.")
+    return ms
 
-    rows = []
-    for d in duties:
-        ms, v = run_time(d)
-        if ms is None:
-            print("  %4.2f      ----   stalled, or never reached the switch" % d)
+
+def table():
+    """Print everything accumulated so far, and what it means."""
+    stroke, rows = _load()
+    if not rows:
+        print("no runs yet. check() -> stroke_measure() -> run(<duty>)")
+        return
+    # Average repeats of the same duty.
+    byduty = {}
+    for d, ms in rows:
+        byduty.setdefault(d, []).append(ms)
+
+    print("stroke: %s" % ("%.1f mm" % stroke if stroke else "NOT MEASURED"))
+    print("target: %.0f-%.0f mm/s (a Mega CD)" % (TARGET_LO, TARGET_HI))
+    print()
+    if stroke:
+        print("  duty   runs    time     velocity   verdict")
+        print("  ----   ----  -------  ----------   -------")
+    else:
+        print("  duty   runs    time")
+        print("  ----   ----  -------")
+
+    inr = []
+    for d in sorted(byduty):
+        good = [m for m in byduty[d] if m > 0]
+        n = len(byduty[d])
+        if not good:
+            print("  %4.2f   %3d      ----   stalled" % (d, n))
             continue
-        if v is None:
-            print("  %4.2f  %5d ms" % (d, ms))
+        ms = sum(good) / len(good)
+        if not stroke:
+            print("  %4.2f   %3d  %5.0f ms" % (d, n, ms))
+            continue
+        v = stroke * 1000.0 / ms
+        if v < TARGET_LO * 0.6:
+            verdict = "too slow"
+        elif v < TARGET_LO:
+            verdict = "slow side"
+        elif v <= TARGET_HI:
+            verdict = "*** IN RANGE ***"
+            inr.append(d)
+        elif v <= TARGET_HI * 1.6:
+            verdict = "fast side"
         else:
-            if v < TARGET_LO * 0.6:
-                verdict = "too slow"
-            elif v < TARGET_LO:
-                verdict = "slow side"
-            elif v <= TARGET_HI:
-                verdict = "*** IN RANGE ***"
-            elif v <= TARGET_HI * 1.6:
-                verdict = "fast side"
-            else:
-                verdict = "too fast"
-            print("  %4.2f  %5d ms  %6.1f mm/s   %s" % (d, ms, v, verdict))
-        rows.append((d, ms, v))
-        time.sleep_ms(400)
+            verdict = "too fast"
+        print("  %4.2f   %3d  %5.0f ms  %6.1f mm/s   %s" % (d, n, ms, v, verdict))
 
     print()
-    if not rows:
-        print("Nothing moved. Work through, in order:")
-        print("  1. sw() must change when you slide the sled by hand")
-        print("  2. pulse() must move it -- if not, IC722's mute/standby pins are the")
-        print("     prime suspect now the DSP's traces are cut")
-        print("  3. if it moves the wrong way, swap SLED_PINS or the motor leads")
-        return rows
-
-    if REF_MM:
-        inr = [r for r in rows if r[2] and TARGET_LO <= r[2] <= TARGET_HI]
-        if inr:
-            print("Mega CD velocity is reachable at duty %s."
-                  % ", ".join("%.2f" % r[0] for r in inr))
-            print("That is the result worth having: a seek becomes ONE continuous sweep")
-            print("at the right speed, and the segmentation the USB path needs goes away.")
-        else:
-            best = min((r for r in rows if r[2]), key=lambda r: r[2], default=None)
-            if best:
-                print("Nothing landed in %.0f-%.0f mm/s. Slowest was %.1f mm/s at duty %.2f."
-                      % (TARGET_LO, TARGET_HI, best[2], best[0]))
-                if best[2] > TARGET_HI:
-                    print("Static friction is setting the floor. Before concluding, try:")
-                    print("  - grease on the rails, or working it back and forth by hand")
-                    print("  - PWM_HZ = 2000: the cogging helps break stiction")
-                    print("  - a brief kick at high duty, then drop to the low duty")
+    if not stroke:
+        print("Run stroke_measure() to turn these into mm/s.")
+    elif inr:
+        print("Mega CD velocity is reachable at duty %s."
+              % ", ".join("%.2f" % d for d in inr))
+        print("That is the result worth having: a seek becomes ONE continuous sweep")
+        print("at the right speed, and the segmentation the USB path needs goes away.")
     else:
-        slowest = max(rows, key=lambda r: r[1])
-        print("Slowest duty that still completed: %.2f (%d ms)."
-              % (slowest[0], slowest[1]))
-        print("Run ref_measure() to turn these into mm/s.")
-    return rows
+        vs = [(d, stroke * 1000.0 / (sum(m for m in byduty[d] if m > 0) /
+              len([m for m in byduty[d] if m > 0])))
+              for d in byduty if any(m > 0 for m in byduty[d])]
+        if vs:
+            d, v = min(vs, key=lambda r: r[1])
+            print("Nothing in %.0f-%.0f mm/s yet. Slowest was %.1f mm/s at duty %.2f."
+                  % (TARGET_LO, TARGET_HI, v, d))
+            if v > TARGET_HI:
+                print("Static friction is setting the floor. Before concluding, try:")
+                print("  - grease on the rails, or working it back and forth by hand")
+                print("  - PWM_HZ = 2000: the cogging helps break stiction")
+                print("  - a brief kick at high duty, then drop to the test duty")
 
 
 def check():
     """Run FIRST. Confirms the switch and both motors before anything is timed."""
     print("switch now: %s" % ("CLOSED (at home)" if sw() else "open (not at home)"))
-    print("slide the sled by hand and call sw() again -- it must change.")
-    print("if it never changes, fix that before going further.")
+    print("slide or wind the sled and call sw() again -- it must change.")
+    print("if it never changes, fix that before anything else.")
     print()
-    print("pulsing OUTWARD for 400 ms...")
-    pulse(0.5, 400, outward=True)
-    out_sw = sw()
-    print("  switch now: %s" % ("CLOSED" if out_sw else "open"))
-    if out_sw:
-        print("  >>> the switch CLOSED after an outward pulse, so the direction is")
-        print("  >>> inverted. Swap SLED_PINS or the motor leads before cal().")
+    print("hopping OUTWARD 300 ms...")
+    out(0.5, 300)
+    if sw():
+        print("  switch CLOSED after an OUTWARD hop, so the direction is inverted.")
+        print("  swap SLED_PINS, or the motor leads, before measuring anything.")
+    else:
+        print("  switch open, as expected")
     print()
-    print("pulsing INWARD for 400 ms...")
-    pulse(0.5, 400, outward=False)
-    print("  switch now: %s" % ("CLOSED" if sw() else "open"))
-    print()
-    print("spindle for 2 s -- you should hear it. If the SLED moves instead, the two")
-    print("motor pairs are swapped: exchange SLED_PINS and SPIN_PINS.")
+    print("spindle for 2 s -- you should hear it. If the SLED moves instead, the")
+    print("two motor pairs are swapped: exchange SLED_PINS and SPIN_PINS.")
     spin(0.4, 2000)
     print()
-    print("when the direction and the pairs are right:  ref_measure()  then  cal()")
+    print("then:  stroke_measure()  then  run(0.25), run(0.30), ...  then  table()")
 
 
 stop()
-print("sled_cal ready.  check()  ->  ref_measure()  ->  cal().  stop() anytime.")
+_s, _r = _load()
+print("sled_cal ready.  check() -> stroke_measure() -> run(duty) -> table()")
+if _r:
+    print("  %d run(s) already stored%s. stop() anytime, clear() to reset."
+          % (len(_r), ", stroke %.1f mm" % _s if _s else ""))
