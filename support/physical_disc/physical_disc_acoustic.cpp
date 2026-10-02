@@ -932,37 +932,43 @@ static void grime_grind(int from_lba, int to_lba, double total_ms)
 	// the ESTIMATED position of the target track, so it misses and the servo corrects
 	// -- the overshoot is the miss. Sizing it from the leftover budget rather than a
 	// fixed fraction means the time gets spent on travel instead of waiting.
-	// Spend the budget on TRAVEL, never on silence, and only in long legs.
+	// MATCH THE SLED VELOCITY, and go one way only.
 	//
-	// A Mega CD fills 1.5-2 s with one continuous traverse because its worm-gear
-	// sled is about three times slower than this one, which crosses the whole disc
-	// in 670 ms. That speed cannot be lowered, so the only way to keep the sled
-	// moving for the modelled duration is to cover more ground -- and once the
-	// target is at the rim, as a CDDA track is, more ground means a reversal.
+	// The drags read as modern quick seeks, and that is velocity: measured, this
+	// drive has exactly two sled speeds and a Mega CD's is in neither of them.
 	//
-	// So: the main traverse, then as many out-and-back pairs as the budget affords,
-	// each leg at least MIN_LEG_MM so it reads as a sweep rather than one of the
-	// equal little steps that got called gravely. If there is not room for a proper
-	// leg, stop: a short jerk is worse than nothing.
+	//   PLAY AUDIO tracking    0.012 mm/s
+	//   SCAN (0xBA)            rejected, not supported
+	//   SET CD SPEED 1x        524 ms per 20 mm against 472 at max -- 11%, no use
+	//   one plain seek         about 48 mm/s
+	//   a Mega CD              about 16-21 mm/s
 	//
-	// It is also roughly what a miss looks like. A long jump runs partially
-	// open-loop to the estimated position, so the servo has to come back and verify.
-	#define MIN_LEG_MM  8.0
-	#define MAX_LEG_MM 16.0
+	// Back-to-back seeks are the only thing that lands in range, because the fixed
+	// per-command cost dominates a short move: a 7.3 mm segment measured 490 ms,
+	// which is 15 mm/s. So segment size IS the velocity control, and solving
+	// n*(FIXED + PER_MM*dist/n) = total for n gives the count that makes the
+	// traverse take exactly as long as the mechanism would -- at the mechanism's
+	// speed, rather than arriving early and waiting.
+	//
+	// Monotonic, and no overshoot. The out-and-back legs this replaces existed only
+	// to burn a budget that a too-fast sweep left over; matching the velocity fills
+	// the time with the real distance instead, so there is nothing to pad and no
+	// reversal to hear. A seek goes one way.
+	//
+	// The step sizes follow an S-curve rather than being equal, because a real seek
+	// accelerates and decelerates, and because equal steps are a metronome.
+	static const double ramp[] = { 0.06, 0.20, 0.42, 0.66, 0.85, 0.95, 0.99, 1.0 };
 
-	double budget = total_ms - RESUME_PLAY_MS;
-	double dir    = (span > 0) ? 1.0 : -1.0;
+	int n = (int)((total_ms - STEP_PER_MM_MS * dist) / STEP_FIXED_MS + 0.5);
+	if (n < 1) n = 1;
+	if (n > 8) n = 8;
 
-	sled_sweep(r1);
-
-	for (int leg = 0; leg < 3 && grime_level() >= 4 && !mirror_aborted(); leg++) {
-		double left = budget - (clock_ms() - grind_start);
-		// An extra pair costs two fixed costs plus the travel of both legs.
-		double x = (left - 2.0 * STEP_FIXED_MS) / (2.0 * STEP_PER_MM_MS);
-		if (x < MIN_LEG_MM) break;
-		if (x > MAX_LEG_MM) x = MAX_LEG_MM;
-		sled_sweep(r1 - dir * x);
-		sled_sweep(r1);
+	for (int i = 1; i <= n; i++) {
+		if (mirror_aborted()) break;
+		// Take the ramp fractions that divide the move into n pieces, so the
+		// profile is the same shape whatever the count.
+		double f = (i == n) ? 1.0 : ramp[(i * 8) / n - 1];
+		sled_sweep(r0 + span * f);
 	}
 
 	// SEEK leaves audio playback stopped, so hand the spindle back to a true 1x.
