@@ -142,6 +142,18 @@ static void sleep_ms(double ms)
 // Waits in chunks so it still notices being told to stop.
 static int mirror_aborted(void);
 
+// Command census. Every SCSI command this engine issues, counted by kind and
+// reported as a rate, because the gesture log counts GESTURES and the drive makes
+// noise per COMMAND. A recording of a live session had 86 audible events in 99 s
+// against roughly 6 modelled head movements, so the two have to be compared
+// directly.
+enum { CMD_SEEK, CMD_READ, CMD_RAW, CMD_PLAY, CMD_PAUSE, CMD_STOP, CMD_SUBQ,
+       CMD_SPIN, CMD_SPEED, CMD_N };
+static const char *cmd_name[CMD_N] =
+	{ "seek", "read", "raw", "play", "pause", "stop", "subq", "spin", "speed" };
+static unsigned cmd_count[CMD_N];
+static void cmd_tick(int which) { if (which >= 0 && which < CMD_N) cmd_count[which]++; }
+
 static void sleep_long_ms(double ms)
 {
 	double end = clock_ms() + ms;
@@ -155,6 +167,7 @@ static void sleep_long_ms(double ms)
 
 static int mirror_seek(int fd, int lba)
 {
+	cmd_tick(CMD_SEEK);
 	uint8_t cdb[10] = { 0 };
 	uint8_t sense[32];
 	struct sg_io_hdr io;
@@ -189,6 +202,7 @@ static int mirror_seek(int fd, int lba)
 // usable as mirror surface and the full radial stroke stays available.
 static int mirror_read_raw(int fd, int lba, int blocks, int timeout_ms)
 {
+	cmd_tick(CMD_RAW);
 	uint8_t cdb[12] = { 0 };
 	uint8_t sense[32];
 	struct sg_io_hdr io;
@@ -225,6 +239,7 @@ static int mirror_read_raw(int fd, int lba, int blocks, int timeout_ms)
 
 static int mirror_read(int fd, int lba, int blocks, int timeout_ms)
 {
+	cmd_tick(CMD_READ);
 	uint8_t cdb[10] = { 0 };
 	uint8_t sense[32];
 	struct sg_io_hdr io;
@@ -275,6 +290,7 @@ static int mirror_read(int fd, int lba, int blocks, int timeout_ms)
 // 120000-sector jump), so one mechanism covers both streaming and seeking.
 static int mirror_play(int fd, int lba, int blocks)
 {
+	cmd_tick(CMD_PLAY);
 	uint8_t cdb[10] = { 0 };
 	uint8_t sense[32];
 	struct sg_io_hdr io;
@@ -306,6 +322,7 @@ static int mirror_play(int fd, int lba, int blocks)
 
 static int mirror_pause(int fd, int resume)
 {
+	cmd_tick(CMD_PAUSE);
 	uint8_t cdb[10] = { 0 };
 	uint8_t sense[32];
 	struct sg_io_hdr io;
@@ -329,6 +346,7 @@ static int mirror_pause(int fd, int resume)
 
 static int mirror_stop_play(int fd)
 {
+	cmd_tick(CMD_STOP);
 	uint8_t cdb[6] = { 0 };
 	uint8_t sense[32];
 	struct sg_io_hdr io;
@@ -353,6 +371,7 @@ static int mirror_stop_play(int fd)
 // mirror re-sync instead of assuming, and tells us whether it is still playing.
 static int mirror_subq(int fd, int *lba_out, int *playing_out)
 {
+	cmd_tick(CMD_SUBQ);
 	uint8_t cdb[10] = { 0 };
 	uint8_t sense[32];
 	uint8_t data[16];
@@ -407,6 +426,7 @@ static int mirror_seek_sync(int fd, int lba)
 
 static void mirror_spin(int fd, int start)
 {
+	cmd_tick(CMD_SPIN);
 	uint8_t cdb[6] = { 0 };
 	uint8_t sense[32];
 	struct sg_io_hdr io;
@@ -860,6 +880,10 @@ static void grime_resume(int lba)
 // short seek's whole budget on nothing.
 #define RESUME_PLAY_MS        40.0
 
+// A PLAY has to be given enough blocks that it does not finish between
+// gestures; otherwise the engine spends its time restarting playback.
+#define PLAY_MIN_BLOCKS      4000
+
 // Drag the sled continuously from one radius to another, taking `total_ms`.
 //
 // This is what the non-blocking SEEK(10) is actually good for. Waiting for each
@@ -1199,7 +1223,25 @@ static void play_gesture(const gesture_t *g)
 	// right thing to do is nothing at all. We only intervene to put the head
 	// somewhere else, which is exactly what a seek is.
 	if (mir.play_mode) {
-		int tail = mir.span_hi - target;
+		// How much to ask PLAY to play. This was span_hi - target clamped to a
+		// minimum of ONE BLOCK, and that minimum was being hit constantly: with a
+		// gain applied, the jump to a CDDA track saturates and pins the mirror
+		// target at span_hi, so tail came out 1. Every PLAY then played a single
+		// sector and stopped, the next gesture saw "not playing" and issued
+		// another, and the drive spent whole music tracks re-acquiring its audio
+		// servo four times a second. A command census put it at play=17 per five
+		// seconds against subq=21 -- essentially one PLAY per gesture -- which is
+		// the skittishness in the owner's recording.
+		//
+		// So guarantee a decent run of blocks: if the head is too near the rim for
+		// that, start the playback a little earlier instead. A fifth of a
+		// millimetre of head offset costs nothing acoustically; a servo
+		// re-acquisition four times a second costs everything.
+		int play_from = target;
+		if (mir.span_hi - play_from < PLAY_MIN_BLOCKS)
+			play_from = mir.span_hi - PLAY_MIN_BLOCKS;
+		if (play_from < mir.span_lo) play_from = mir.span_lo;
+		int tail = mir.span_hi - play_from;
 		if (tail < 1) tail = 1;
 
 		switch (g->kind) {
@@ -1213,11 +1255,29 @@ static void play_gesture(const gesture_t *g)
 				// Red Book audio: the original deck tracked this smoothly and
 				// quietly, and so does this one. Only step in if the drive has
 				// drifted from where the model says the head should be.
-				int pos = 0, playing = 0;
-				if (mirror_subq(mir.dev_fd, &pos, &playing)) { playing = 0; pos = -1; }
+				// Poll about once a second, not on every gesture. This is only a
+				// drift check, and a census showed it running at 4.2 commands per
+				// second for the whole session -- some 400 in the 99 s recording
+				// that was described as skittish. Between polls, carry the last
+				// answer: drift accumulates at about 75 sectors a second, so a
+				// second of staleness cannot hide the 400 that matters.
+				static double polled_at;
+				static int    last_pos, last_playing;
+				int pos = last_pos, playing = last_playing;
+				if (clock_ms() - polled_at > 950.0) {
+					if (mirror_subq(mir.dev_fd, &pos, &playing)) { playing = 0; pos = -1; }
+					polled_at = clock_ms();
+					last_pos = pos; last_playing = playing;
+				}
+				// Against play_from, not target. The PLAY start is deliberately
+				// backed off from the target by up to PLAY_MIN_BLOCKS so playback has
+				// room to run, so the drive's position is legitimately that far from
+				// the target -- comparing the two made drift exceed its threshold on
+				// every gesture and reinstated the very PLAY storm the back-off was
+				// added to stop (play=21 per five seconds, one per gesture).
 				int drift = (pos < 0) ? INT_MAX
-				          : (pos > target ? pos - target : target - pos);
-				if (!playing || drift > 400) mirror_play(mir.dev_fd, target, tail);
+				          : (pos > play_from ? pos - play_from : play_from - pos);
+				if (!playing || drift > 400) mirror_play(mir.dev_fd, play_from, tail);
 
 				// No nudging during playback. A tick out and a pull back, in
 				// one place, is a drive hunting -- it reads as a broken laser,
@@ -1272,12 +1332,30 @@ static void play_gesture(const gesture_t *g)
 				//
 				// So re-aim only when the head is actually somewhere else, the
 				// same test the audio branch already used.
-				int pos = 0, playing = 0;
-				if (mirror_subq(mir.dev_fd, &pos, &playing)) { playing = 0; pos = -1; }
+				// Poll about once a second, not on every gesture. This is only a
+				// drift check, and a census showed it running at 4.2 commands per
+				// second for the whole session -- some 400 in the 99 s recording
+				// that was described as skittish. Between polls, carry the last
+				// answer: drift accumulates at about 75 sectors a second, so a
+				// second of staleness cannot hide the 400 that matters.
+				static double polled_at;
+				static int    last_pos, last_playing;
+				int pos = last_pos, playing = last_playing;
+				if (clock_ms() - polled_at > 950.0) {
+					if (mirror_subq(mir.dev_fd, &pos, &playing)) { playing = 0; pos = -1; }
+					polled_at = clock_ms();
+					last_pos = pos; last_playing = playing;
+				}
+				// Against play_from, not target. The PLAY start is deliberately
+				// backed off from the target by up to PLAY_MIN_BLOCKS so playback has
+				// room to run, so the drive's position is legitimately that far from
+				// the target -- comparing the two made drift exceed its threshold on
+				// every gesture and reinstated the very PLAY storm the back-off was
+				// added to stop (play=21 per five seconds, one per gesture).
 				int drift = (pos < 0) ? INT_MAX
-				          : (pos > target ? pos - target : target - pos);
+				          : (pos > play_from ? pos - play_from : play_from - pos);
 				if (!playing || drift > 400) {
-					mirror_play(mir.dev_fd, target, tail);
+					mirror_play(mir.dev_fd, play_from, tail);
 					acu_log("  re-aim: playing=%d drift=%d\n", playing, drift);
 				}
 				if (grime_level() >= 9 && !(grime_rng() % 12)) grime_hunt(target, 1.5, 0);
@@ -1301,7 +1379,7 @@ static void play_gesture(const gesture_t *g)
 				grime_grind(from, target, g->dur_ms);
 			}
 			else {
-				mirror_play(mir.dev_fd, target, tail);
+				mirror_play(mir.dev_fd, play_from, tail);
 				sleep_ms(g->dur_ms - (clock_ms() - start));
 			}
 			break;
@@ -1395,7 +1473,7 @@ static void play_gesture(const gesture_t *g)
 				sleep_long_ms(g->dur_ms * 0.7);
 				mir.spun = 1;
 			}
-			mirror_play(mir.dev_fd, target, tail);
+			mirror_play(mir.dev_fd, play_from, tail);
 			// A hazy lens takes several goes to focus. Everyone who owned one
 			// of these knows the sound of a console thinking about it. Only if
 			// the budget can take it: each wander is now a drag rather than a
@@ -1602,6 +1680,28 @@ static void *worker_main(void *arg)
 			continue;
 		}
 		mir.released = 0;
+
+		// Census every five seconds. The drive makes noise per COMMAND, not per
+		// gesture, so this is the number to compare against a recording.
+		{
+			static double census_at = 0;
+			double now = clock_ms();
+			if (now - census_at > 5000.0) {
+				static unsigned prev[CMD_N];
+				char line[220];
+				int  ln = 0, any = 0;
+				for (int c = 0; c < CMD_N; c++) {
+					unsigned d = cmd_count[c] - prev[c];
+					prev[c] = cmd_count[c];
+					if (d && ln < (int)sizeof(line) - 24) {
+						ln += snprintf(line + ln, sizeof(line) - ln, " %s=%u", cmd_name[c], d);
+						any = 1;
+					}
+				}
+				if (any) acu_log("  cmds/5s:%s\n", line);
+				census_at = now;
+			}
+		}
 
 		if (mir.profile_req != applied_profile) {
 			applied_profile = mir.profile_req;

@@ -264,6 +264,58 @@ slower. Measure a candidate by full-stroke synced seek time: this Mitsumi does
 Direct servo control is not available: the servo is inside the drive firmware and no
 SCSI path exposes it.
 
+### Listening to the recording, which beat every other diagnostic
+
+The owner sent a 99 s phone recording of a live session. It cannot be heard here,
+but it can be measured: ffmpeg to raw PCM, 10 ms RMS envelope, threshold at
+30% of the floor-to-peak range, runs joined across gaps under 80 ms.
+
+```
+86 events over 99.3 s
+  a handful loud and long : 4.93s, 4.44s, 3.21s, 1.50s, 1.28s  (-34 to -44 dB)
+  dozens quiet and short  : 0.08-0.72s                          (-55 dB)
+  modulation inside the long events: 1-4 Hz at depth 0.01-0.10
+```
+
+Two conclusions, and the first one overturned the plan. **The segmentation was not
+the problem** -- modulation depth inside the long drags is low, so the stepping is
+not what was being heard. And **the gesture log accounted for about 6 head movements
+in that span against 86 audible events**, so something was making noise fourteen
+times more often than the model knew.
+
+A per-command census found it, because the drive makes noise per COMMAND and the log
+counted gestures:
+
+```
+subq=21 per 5s   4.2/s, the entire session
+play=16-17 per 5s 3.4/s, throughout every CDDA track
+```
+
+The PLAY storm was a real bug. `tail = span_hi - target` clamped to a minimum of ONE
+block, and with a gain applied the jump to a CDDA track saturates and pins the target
+at `span_hi` -- so tail came out 1, every PLAY played a single sector and stopped,
+the next gesture saw "not playing", and the drive spent whole music tracks
+re-acquiring its audio servo four times a second.
+
+Fixed by giving PLAY at least `PLAY_MIN_BLOCKS` and backing the start off when the
+head is too near the rim for that. Which then reinstated the storm from the other
+side, because the drift check still compared the drive's position against `target`
+while playback legitimately started up to 4000 sectors earlier -- it has to compare
+against the actual play start. And the sub-channel poll, which is only a drift check,
+now runs at 1 Hz rather than once per gesture.
+
+```
+command rate, steady state : 7.6/s -> 1.4/s
+subq                       : 4.2/s -> 1.0/s
+play during CDDA           : 3.4/s -> 0.2-1.0/s
+```
+
+**Keep the recording loop.** `/c/t/analyse.py` takes an audio file and prints event
+durations and their modulation. A static ffmpeg is at `/usr/local/bin` in WSL (apt is
+broken on this machine -- systemd dpkg error -- so it came from
+johnvansickle.com/ffmpeg). Asking for a phone recording and measuring it found in one
+pass what several rounds of reasoning about the gesture log had missed.
+
 ### On the sources
 
 Genesis Plus GX's author says its CDD latency model is *"not accurate to how the
