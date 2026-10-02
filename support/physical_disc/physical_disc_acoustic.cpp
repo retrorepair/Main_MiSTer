@@ -876,42 +876,21 @@ static void grime_resume(int lba)
 // and forth in one place is what a drive does when it cannot track.
 static int g_drag_segs;
 
-static void sled_drag(double r_from, double r_to, double total_ms)
+// One sweep. A single bare SEEK, which the drive executes as one continuous
+// worm-gear traverse -- the Mega CD's sled runs on a worm gear and two rails, and
+// that is a continuous whirr, not a ratchet.
+//
+// Everything cleverer than this sounded wrong. Equal segments gave a 2-3 Hz chug
+// ("gravely", "jittery") because each one accelerates, decelerates and settles. A
+// coarse-then-fine pair was better but still two starts. The real servo corrects at
+// up to 75 Hz -- the CDD runs its command loop once per sector period -- which is
+// twenty times faster than anything reachable over USB, so fine structure is simply
+// not available here. One clean sweep is.
+static void sled_sweep(double r_to)
 {
-	double dist = r_to > r_from ? r_to - r_from : r_from - r_to;
-
-	// No sleeping and no sync. Back-to-back BARE seeks are what make continuous
-	// motion: the drive takes one move at a time, so the next SEEK blocks until the
-	// current one finishes and the sled never stops. Its own serialisation is the
-	// clock.
-	//
-	// Measured 192 ms for a 0.7 mm step issued this way, against 300-700 ms for the
-	// same step through mirror_seek_sync -- the sub-channel read was pure overhead.
-	// Sleeping between them, which is what this did first, added the budget on top
-	// of the drive's serialisation and overran by 5x.
-	//
-	// n steps cost n*FIXED + PER_MM*dist, the distance term being paid once however
-	// it is divided, so n = (total - PER_MM*dist) / FIXED fills the duration.
-	int n = (int)((total_ms - STEP_PER_MM_MS * dist) / STEP_FIXED_MS + 0.5);
-	if (n < 1) n = 1;
-	if (n > 40) n = 40;
-
-	g_drag_segs     += n;
-	double start     = clock_ms();
-	double step_cost = STEP_FIXED_MS + STEP_PER_MM_MS * (dist / n);
-
-	for (int i = 1; i <= n; i++) {
-		if (mirror_aborted()) break;
-		// The drive varies run to run, so stop when the budget is gone rather than
-		// committing to the count: a traverse that runs long is heard against
-		// whatever the game has moved on to.
-		if (i > 1 && clock_ms() - start + step_cost > total_ms) break;
-		double f = (double)i / n;
-		mirror_seek(mir.dev_fd, media_lba_at_radius(r_from + (r_to - r_from) * f));
-	}
-
-	// Land on the target even if the budget cut the walk short.
-	if (!mirror_aborted()) mirror_seek(mir.dev_fd, media_lba_at_radius(r_to));
+	if (mirror_aborted()) return;
+	mirror_seek(mir.dev_fd, media_lba_at_radius(r_to));
+	g_drag_segs++;
 }
 
 static void grime_grind(int from_lba, int to_lba, double total_ms)
@@ -940,33 +919,30 @@ static void grime_grind(int from_lba, int to_lba, double total_ms)
 		return;
 	}
 
-	// ONE CONTINUOUS DRAG, not a row of discrete steps.
+	// TWO SWEEPS AND ONE TURNAROUND.
 	//
-	// The staircase this replaces was built on synchronised seeks, which meant
-	// 50 ms of travel followed by 300-700 ms of waiting, over and over. Measured in
-	// service the budget only ever bought one or two of those, so a cross-disc seek
-	// came out as a short jerk, a long silence and a reversal -- weak, and closer to
-	// a drive that cannot find its place than one working hard.
+	// This drive crosses the whole disc in about 670 ms; a Mega CD takes 1.5-2 s,
+	// because its sled is a slow worm gear. So a single sweep leaves most of the
+	// budget as silence, and subdividing it into equal steps is the chug that got
+	// called gravely. The way out is distance, not subdivision: overshoot the target
+	// and come back. Two continuous sweeps, one direction change, and the sled is
+	// moving almost the whole time.
 	//
-	// sled_drag re-aims along the path without waiting, so the sled is in motion for
-	// the entire duration and the whole budget becomes sound instead of mostly
-	// silence. It also cannot overrun, which the step budget could.
-	double drag_ms = total_ms - RESUME_PLAY_MS;
-	if (drag_ms < STEP_FIXED_MS) drag_ms = STEP_FIXED_MS;
+	// It is also what the mechanism does. A long jump is run partially open-loop to
+	// the ESTIMATED position of the target track, so it misses and the servo corrects
+	// -- the overshoot is the miss. Sizing it from the leftover budget rather than a
+	// fixed fraction means the time gets spent on travel instead of waiting.
+	double direct = 2.0 * STEP_FIXED_MS + STEP_PER_MM_MS * dist;
+	double spare  = total_ms - RESUME_PLAY_MS - direct;
+	double over   = (spare > 0.0) ? spare / (2.0 * STEP_PER_MM_MS) : 0.0;
+	if (over > 12.0) over = 12.0;
 
-	// A tired mechanism runs past the target and has to come back. Dragging out and
-	// back keeps that a continuous movement -- a reversal at the end of a traverse,
-	// which is what settling sounds like -- rather than the two isolated jerks the
-	// synchronised version produced.
-	if (grime_level() >= 4) {
-		double over    = dist * 0.12 + 0.3;
-		double r_over  = r1 + (span > 0 ? over : -over);
-		double out_ms  = drag_ms * 0.80;
-		sled_drag(r0, r_over, out_ms);
-		sled_drag(r_over, r1, drag_ms - out_ms);
+	if (grime_level() >= 4 && over > 0.3) {
+		sled_sweep(r1 + (span > 0 ? over : -over));
+		sled_sweep(r1);
 	}
 	else {
-		sled_drag(r0, r1, drag_ms);
+		sled_sweep(r1);
 	}
 
 	// SEEK leaves audio playback stopped, so hand the spindle back to a true 1x.
@@ -1011,8 +987,8 @@ static void grime_hunt(int lba, double reach_mm, int reps)
 		// and a row of them in one place is what a drive does when the laser has
 		// lost the track. Dragging keeps the wander a continuous movement.
 		double here = media_radius_mm(lba);
-		sled_drag(here, here + away, 120.0 + (grime_rng() % 140));
-		sled_drag(here + away, here, 100.0 + (grime_rng() % 120));
+		sled_sweep(here + away);
+		sled_sweep(here);
 	}
 	grime_aim(lba);           // finally settles where it was supposed to be
 	grime_resume(lba);
@@ -1176,7 +1152,7 @@ static void play_gesture(const gesture_t *g)
 				// twice over: a real sled advances monotonically through a read,
 				// and 0.35 mm of travel each way four times a second is a drive
 				// hunting in place -- audibly a laser that cannot track. The
-				// sound of a load is the TRAVERSES, which sled_drag now makes
+				// sound of a load is the TRAVERSES, which sled_sweep now makes
 				// continuous; between them the mechanism is entitled to be quiet.
 				mirror_play(mir.dev_fd, target, tail);
 				if (grime_level() >= 9 && !(grime_rng() % 12)) grime_hunt(target, 1.5, 0);
@@ -1258,21 +1234,22 @@ static void play_gesture(const gesture_t *g)
 
 			if (grime_level() && !mir.phys_session && mir.dev_fd >= 0) {
 				double here = media_radius_mm(target);
-				double off  = 0.8 + 0.25 * grime_level();
-				// Settle INWARD when there is no room outward. A CDDA track
-				// sits toward the outside, and with a gain applied the jump to
-				// it saturates and parks the head at the rim -- where an
-				// outward excursion clamps and the settle would be silent, in
-				// exactly the case this exists for.
+				double off  = 0.4 + 0.12 * grime_level();
+				// Settle INWARD when there is no room outward. A CDDA track sits
+				// toward the outside, and with a gain applied the jump to it
+				// saturates and parks the head at the rim -- where an outward
+				// excursion clamps and the settle would be silent, in exactly the
+				// case this exists for.
 				if (here + off > mir.r_hi) off = -off;
-				double away = g->dur_ms * 0.28;
-				double back = g->dur_ms * 0.62;
-				if (away + back < g->dur_ms) {
-					sled_drag(here, here + off, away);
-					sled_drag(here + off, here, back);
+				// Two moves, not two drags. This is the servo closing the loop and
+				// verifying the address, which is a short correction -- four chunks
+				// here was part of what sounded gravely.
+				double cost = 2.0 * (STEP_FIXED_MS + STEP_PER_MM_MS * (off < 0 ? -off : off));
+				if (cost < g->dur_ms) {
+					sled_sweep(here + off);
+					sled_sweep(here);
 					grime_resume(target);
-					acu_log("  settle %+.1fmm from %.1fmm over %.0fms\n",
-					        off, here, away + back);
+					acu_log("  settle %+.1fmm from %.1fmm\n", off, here);
 				}
 			}
 			sleep_ms(g->dur_ms - (clock_ms() - start));
