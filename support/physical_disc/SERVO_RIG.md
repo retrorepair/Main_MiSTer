@@ -37,7 +37,59 @@ broadband (24% of its energy at 2.5–6 kHz). So:
 **Halving the velocity doubles the impulses.** That trade is the wall, and it is a
 property of the interface, not of the code.
 
-## What the rig does not need
+## Three routes, and the cheap one first
+
+The goal is both halves at once: read the real disc AND sound like the real console.
+Ranked by effort.
+
+### A. A period-correct drive. No electronics.
+
+The drive in use is a **12x** unit, and its sled is fast because it was built to be.
+A **1x or 2x CD-ROM drive from 1992-95** has a mechanism of the same generation and
+design intent as a console's, and it reads discs through the code path that already
+works. Nothing changes in software.
+
+Measured verdict on the 12x Mitsumi, from `drivecheck.py`:
+
+```
+full-stroke seek   700 ms  ->  46 mm/s     "TOO FAST, will clatter"
+4 mm legs          292 ms each -> 14 mm/s  (right speed, 8 legs = 16 impulses)
+8 mm legs          202 ms each -> 40 mm/s  (wrong speed, 4 legs)
+SCAN (0xBA)        rejected
+SET CD SPEED       honoured, but only an 8% difference
+```
+
+Period 1x drives specced 400-600 ms *average* access, which usually implies well
+over a second full-stroke -- in Mega CD range. If that holds, segmentation goes away
+entirely and a seek becomes one continuous sweep at the right velocity.
+
+Candidates: Mitsumi FX001D / LU005 (1x), Panasonic CR-562 (2x), Sony CDU-55/76 (2x),
+Toshiba XM-3301 (1x SCSI). ATAPI via a USB-IDE bridge; SCSI needs more thought.
+
+**Characterise any candidate with `drivecheck.py`** (kept at /media/fat on the test
+box): it needs a reasonably full CD, measures full-stroke velocity and back-to-back
+leg cost, checks SCAN and SET CD SPEED, and prints a verdict against the 16-21 mm/s
+target.
+
+### B. A real console CD block over its native protocol
+
+The actual mechanism making its actual noises while reading the actual disc, with the
+servo and decoder electronics on the console's own board doing all the reading.
+
+More tractable than it looks for the Mega CD, because **the CDD protocol is
+documented** -- see the MegaSD notes: ten 4-bit nibbles over HOCK/CDCK at 75 Hz, with
+full command and status tables (0x03 READ/PLAY, 0x04 SEEK, status 0x02 SEEK, 0x0A
+TRK_MOVE, and so on). The MiSTer core already emulates that CDD, so the work is
+swapping an emulated device for a real one.
+
+The cost is that it is per-console: Mega CD's CDD, the PS1's CXD-series block and
+Saturn's are different interfaces and different integrations.
+
+### C. Bare optical block plus your own servo and decoder
+
+Everything below. Highest effort by a wide margin.
+
+## Route C in detail: what a noise-only rig does not need
 
 It does not need to read discs. The MiSTer core already has the data — from a CHD —
 and in this design the drive is **only a noise source**. That separation is already
