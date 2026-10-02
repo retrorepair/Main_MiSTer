@@ -109,6 +109,7 @@ typedef struct {
 	int span_lo, span_hi;
 	double media_full;
 	double r_lo, r_hi;
+	double last_r;
 
 	pthread_t worker;
 } mirror_state_t;
@@ -886,10 +887,20 @@ static int g_drag_segs;
 // up to 75 Hz -- the CDD runs its command loop once per sector period -- which is
 // twenty times faster than anything reachable over USB, so fine structure is simply
 // not available here. One clean sweep is.
+static double g_seg_ms[8];
+static double g_seg_mm[8];
+
 static void sled_sweep(double r_to)
 {
 	if (mirror_aborted()) return;
+	double from = (mir.last_r > 0.0) ? mir.last_r : r_to;
+	double st   = clock_ms();
 	mirror_seek(mir.dev_fd, media_lba_at_radius(r_to));
+	if (g_drag_segs < 8) {
+		g_seg_ms[g_drag_segs] = clock_ms() - st;
+		g_seg_mm[g_drag_segs] = (r_to > from) ? r_to - from : from - r_to;
+	}
+	mir.last_r = r_to;
 	g_drag_segs++;
 }
 
@@ -955,21 +966,72 @@ static void grime_grind(int from_lba, int to_lba, double total_ms)
 	// the time with the real distance instead, so there is nothing to pad and no
 	// reversal to hear. A seek goes one way.
 	//
-	// The step sizes follow an S-curve rather than being equal, because a real seek
-	// accelerates and decelerates, and because equal steps are a metronome.
-	static const double ramp[] = { 0.06, 0.20, 0.42, 0.66, 0.85, 0.95, 0.99, 1.0 };
+	// EQUAL distances, which is the only way the velocity comes out constant.
+	//
+	// An S-curve ramp sat here, on the reasoning that a real seek accelerates and
+	// that equal steps are a metronome. Measuring per segment showed it was the
+	// bug, not the polish: one drag came out
+	//
+	//   2ms/6.5mm=3400   315ms/14.9mm=47   538ms/9.4mm=17   412ms/1.6mm=4   mm/s
+	//
+	// -- nothing, a zip, a correct grind, then a crawl, averaging to a respectable
+	// 17 mm/s that was never actually played. The tail segment is the giveaway: a
+	// short leg still pays the whole fixed per-command cost, so making legs unequal
+	// makes their velocities unequal, and the ear hears the pieces, not the mean.
+	// That is the reported inconsistency, and why it came out right occasionally --
+	// one segment in four was at Mega CD speed.
+	//
+	// Equal legs pay the same cost and cover the same ground: velocity is then
+	// L/(FIXED + PER_MM*L) for every one of them.
+	// ...and the leg LENGTH has to come from what the drive is actually doing,
+	// because its per-command cost swings two to three times from pass to pass. The
+	// same 8.1 mm leg has measured 222 ms and 750 ms, so a fixed plan gives 20 mm/s
+	// on one seek and 35 mm/s on the next -- right sometimes and modern the rest of
+	// the time, which is exactly how this has been reported all along.
+	//
+	// Velocity is L/(fixed + PER_MM*L), so it is controllable: a pass where the
+	// drive is running quick needs SHORTER legs to stay slow, because the fixed cost
+	// is what holds the speed down. Measure each leg, keep a running estimate of the
+	// fixed cost, and re-solve for the length that hits the velocity the mechanism
+	// would have had.
+	double want_v = (total_ms > 1.0) ? dist / total_ms : 0.02;   // mm per ms
+	double denom  = 1.0 - STEP_PER_MM_MS * want_v;
+	double fixed  = STEP_FIXED_MS;
+	double gone   = 0.0;
+	int    segs   = 0;
 
-	int n = (int)((total_ms - STEP_PER_MM_MS * dist) / STEP_FIXED_MS + 0.5);
-	if (n < 1) n = 1;
-	if (n > 8) n = 8;
+	while (gone < dist - 0.10 && segs < 12 && !mirror_aborted()) {
+		double L = (denom > 0.05) ? fixed * want_v / denom : dist;
+		if (L < 0.8) L = 0.8;
+		// Never leave a stub behind: a short final leg still pays the whole fixed
+		// cost, so it comes out at 4-6 mm/s and is heard as the drag dying away.
+		// If the remainder is less than another leg and a half, take it all now.
+		if (dist - gone < L * 1.5) L = dist - gone;
 
-	for (int i = 1; i <= n; i++) {
-		if (mirror_aborted()) break;
-		// Take the ramp fractions that divide the move into n pieces, so the
-		// profile is the same shape whatever the count.
-		double f = (i == n) ? 1.0 : ramp[(i * 8) / n - 1];
-		sled_sweep(r0 + span * f);
+		double st = clock_ms();
+		gone += L;
+		sled_sweep(r0 + (span > 0 ? gone : -gone));
+		double el = clock_ms() - st;
+
+		// Only a leg that actually blocked tells us anything: the first one returns
+		// in about a millisecond because the sled is not yet moving.
+		//
+		// Gently. A leg's elapsed time is really the PREVIOUS leg's travel -- the
+		// measurement is delayed by one -- so a high gain on it rings: 0.6 gave
+		// 27, 15, 23, 6 mm/s within a single drag.
+		if (el > 20.0) {
+			double f = el - STEP_PER_MM_MS * L;
+			if (f > 40.0 && f < 1500.0) fixed = fixed * 0.75 + f * 0.25;
+		}
+
+		segs++;
+		if (clock_ms() - grind_start > total_ms) break;
 	}
+
+	// Land exactly, but only if the loop did not already arrive. An unconditional
+	// final seek was travelling 0.0 mm and blocking for up to 1257 ms waiting on the
+	// previous move, which showed up as a 1.3x overrun.
+	if (!mirror_aborted() && gone < dist - 0.10) sled_sweep(r1);
 
 	// SEEK leaves audio playback stopped, so hand the spindle back to a true 1x.
 	grime_resume(to_lba);
@@ -979,8 +1041,25 @@ static void grime_grind(int from_lba, int to_lba, double total_ms)
 	// truncating a 714 ms remainder.
 	sleep_long_ms(total_ms - (clock_ms() - grind_start));
 
-	acu_log("  drag %.1fmm over %.0fms in %d segs, whole %.0fms\n",
-	        dist, total_ms, g_drag_segs, clock_ms() - grind_start);
+	// Report the per-segment VELOCITY, because that is what the ear judges and it
+	// is not a constant: the same move has cost 263+288 ms on one pass and
+	// 407+711 ms on another. At 700 ms a 7 mm segment is 16 mm/s, a Mega CD; at
+	// 250 ms it is 45 mm/s, a modern drive. The same code therefore produces both
+	// sounds, which is the reported inconsistency -- it was heard correctly "a few
+	// times". This is the measurement that shows which pass was which.
+	{
+		char v[220];
+		int  vn = 0;
+		int  ns = (g_drag_segs < 8) ? g_drag_segs : 8;
+		double whole = clock_ms() - grind_start;
+		for (int i = 0; i < ns && vn < (int)sizeof(v) - 20; i++)
+			vn += snprintf(v + vn, sizeof(v) - vn, " %.0fms/%.1fmm=%.0f",
+			               g_seg_ms[i], g_seg_mm[i],
+			               g_seg_ms[i] > 1.0 ? g_seg_mm[i] * 1000.0 / g_seg_ms[i] : 0.0);
+		acu_log("  drag %.1fmm over %.0fms in %d segs, whole %.0fms, mean %.0fmm/s |%s\n",
+		        dist, total_ms, g_drag_segs, whole,
+		        whole > 1.0 ? dist * 1000.0 / whole : 0.0, v);
+	}
 }
 
 // A worn mechanism does not slip once and recover neatly. It slips, grabs,

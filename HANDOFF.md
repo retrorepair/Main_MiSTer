@@ -202,6 +202,68 @@ Lesson worth keeping: a command that moves the head 0 mm is not silent. Every PL
 re-establishes the audio servo and is audible. Count commands issued, not millimetres
 modelled.
 
+### Velocity, and why it was right only sometimes
+
+The owner's key observation was that the correct sound DID happen, a few times, but
+inconsistently. That rules out a hardware wall and points at variance, and measuring
+per segment found it.
+
+This drive has two sled speeds and a Mega CD's is in neither:
+
+```
+PLAY AUDIO tracking   0.012 mm/s
+SCAN (0xBA)           rejected, not supported
+SET CD SPEED 1x       524 ms per 20 mm against 472 at max -- 11%, no use
+one plain seek        about 48 mm/s
+a Mega CD             about 16-21 mm/s
+```
+
+Back-to-back seeks are the only thing in range, because the fixed per-command cost
+dominates a short move. So segment length IS the velocity control:
+`v = L / (FIXED + PER_MM*L)`, and shorter legs are SLOWER.
+
+**The S-curve ramp was the bug.** Added to avoid a metronome, it made the last leg
+tiny while still paying the full fixed cost. One drag measured:
+
+```
+2ms/6.5mm=3400   315ms/14.9mm=47   538ms/9.4mm=17   412ms/1.6mm=4   mm/s
+```
+
+Nothing, a zip, a correct grind, a crawl -- averaging to a respectable 17 mm/s that
+was never played. One leg in four was at Mega CD speed, which is exactly "heard it a
+few times".
+
+**The drive's own cost varies 2-3x pass to pass**, 222 to 971 ms for an identical
+8.1 mm leg, so a fixed plan gives 20 mm/s on one seek and 35 on the next. Equal legs
+fixed the within-drag spread; the between-drag spread needed a feedback loop that
+measures each leg, keeps a running estimate of the fixed cost, and re-solves for the
+length that hits the target velocity.
+
+Two details that matter: the first leg always returns in ~1 ms because the sled is
+not yet moving, so only a leg that blocked carries information; and a leg's elapsed
+time is really the PREVIOUS leg's travel, so the measurement lags by one and a high
+gain rings (0.6 gave 27, 15, 23, 6 mm/s inside one drag -- 0.25 is stable).
+
+Also removed: an unconditional final "land exactly" seek that travelled 0.0 mm and
+blocked up to 1257 ms on the previous move, and any stub remainder leg, which still
+pays the whole fixed cost and so comes out at 4-6 mm/s.
+
+```
+per-drag mean velocity : 14-20 mm/s   (was 11-18 with legs at 32-36)
+duration               : 1.00-1.13x
+trailing 0.0mm leg     : gone
+stub legs              : gone
+```
+
+Still open: the within-drag spread is damped, not eliminated (legs still range
+14-35 mm/s), because the drive's variance is large and the measurement lags. The
+remaining lever with real headroom is mechanical -- a drive whose sled is genuinely
+slower. Measure a candidate by full-stroke synced seek time: this Mitsumi does
+670 ms and a Mega CD wants 1.5-2 s.
+
+Direct servo control is not available: the servo is inside the drive firmware and no
+SCSI path exposes it.
+
 ### On the sources
 
 Genesis Plus GX's author says its CDD latency model is *"not accurate to how the
