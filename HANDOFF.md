@@ -109,6 +109,40 @@ It also only ever sees *net* displacement during a burst, because commands seria
 and the poller stalls behind each move. The elapsed time in `/tmp/acoustic.log` is
 the reliable evidence: n blocking seeks taking 1288 ms means 1288 ms of motion.
 
+## THE REASON IT KEPT SOUNDING "NO DIFFERENT"
+
+The owner was listening to the **stock binary**. Proven by launching Sonic CD the
+way they do -- a plain `MegaCD` core from a CHD -- and reading `/proc/<pid>/exe`:
+
+```
+BEFORE:  exe: /media/fat/MiSTer             core: MegaCD   <- stock, empty log
+AFTER:   exe: /media/fat/MiSTer_Physical-CD core: MegaCD   <- 132 log lines
+```
+
+`main=MiSTer_Physical-CD` sits under `[A0CD-*]`, so it only applies to cores named
+`A0CD-...`. A CHD launch produces the core name `MegaCD`, nothing matches, and the
+global `main=ConsoleMode/MiSTer_ConsoleMode` **points at a directory that does not
+exist on the card**, so MiSTer keeps the stock binary it booted with. Stock has no
+acoustic mirroring at all.
+
+Fixed by appending to `MiSTer.ini`:
+
+```
+[MegaCD]
+main=MiSTer_Physical-CD
+```
+
+This very likely explains the whole run of "it makes the right noises... sometimes"
+and "maybe 20% of the time" reports. Whether the feature ran at all depended on
+launch order: my own deploy scripts leave the board running the build via a
+two-stage launch, so a listen straight after a deploy heard it, and a listen after
+launching the game manually heard stock. The same gate applies to PSX, Saturn,
+PCECD, NeoGeoCD, 3DO and CD-i launched from images -- each needs its own section, or
+the dangling global `main=` needs fixing.
+
+**Check `/proc/<pid>/exe` before trusting any listening test.** I had documented
+this trap and then only solved it for my own harness.
+
 ## Test harness — three traps that each silently run the STOCK binary
 
 1. `/etc/inittab` uses `::sysinit:/media/fat/MiSTer &` — **sysinit, not respawn**.
