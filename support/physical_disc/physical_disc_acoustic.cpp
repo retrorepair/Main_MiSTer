@@ -890,7 +890,7 @@ static void sled_drag(double r_from, double r_to, double total_ms)
 	if (n < 1) n = 1;
 	if (n > 40) n = 40;
 
-	g_drag_segs      = n;
+	g_drag_segs     += n;
 	double start     = clock_ms();
 	double step_cost = STEP_FIXED_MS + STEP_PER_MM_MS * (dist / n);
 
@@ -913,6 +913,7 @@ static void grime_grind(int from_lba, int to_lba, double total_ms)
 	if (mir.dev_fd < 0 || mir.phys_session) return;
 
 	double grind_start = clock_ms();
+	g_drag_segs = 0;
 
 	double r0   = media_radius_mm(from_lba);
 	double r1   = media_radius_mm(to_lba);
@@ -927,8 +928,9 @@ static void grime_grind(int from_lba, int to_lba, double total_ms)
 	// played as a long one is what made a 0.6 mm hop sound identical to a cross-disc
 	// transition. One move, and let the sync pay for it.
 	if (total_ms < DRIVE_MIN_SEEK_MS * 2.0 || dist < 0.30) {
-		mirror_seek_sync(mir.dev_fd, to_lba);
+		mirror_seek(mir.dev_fd, to_lba);
 		grime_resume(to_lba);
+		sleep_ms(total_ms - (clock_ms() - grind_start));
 		return;
 	}
 
