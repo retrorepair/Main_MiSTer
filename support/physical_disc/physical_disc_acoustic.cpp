@@ -1041,7 +1041,33 @@ static void grime_grind(int from_lba, int to_lba, double total_ms)
 	double fixed  = fixed_est;
 	double prev_L = 0.0;
 
-	while (gone < dist - 0.10 && segs < 12 && !mirror_aborted()) {
+	// LEG COUNT IS THE GRIME DIAL, because the two things being traded are both
+	// audible and only an ear can choose between them.
+	//
+	// Every leg boundary is a stop and a start, and the sled's stop/start is a
+	// structure-borne impulse -- the owner recorded this with the phone sitting on
+	// the drive in a silent room, and those events are 93% below 200 Hz with nearly
+	// nothing above, which is what a mechanical thump through a chassis looks like.
+	// (I had read them as room noise. They are not. They are the mechanism.)
+	//
+	// Velocity, meanwhile, needs MORE legs: one sweep across the disc is 48 mm/s
+	// where a Mega CD is 16-21, and four legs bring it to about 20. So halving the
+	// speed doubles the impulses, and there is no continuous mid-speed primitive to
+	// escape with -- SCAN is rejected by the drive and a read advances the sled at
+	// 0.012 mm/s.
+	//
+	//   1 leg  -> 48 mm/s, 2 impulses   (clean, but a modern seek)
+	//   4 legs -> 20 mm/s, 8 impulses   (right speed, more thumps)
+	//   8 legs -> 15 mm/s, 16 impulses  (slower still, thumpier)
+	//
+	// So PHYSICAL_DISC_ACOUSTIC_GRIME picks the point on that curve: low for a
+	// quick clean sweep, high for a slow grinding one that clatters more. It can be
+	// changed in MiSTer.ini and tried by ear without a rebuild.
+	int max_legs = 1 + grime_level();
+	if (max_legs < 1)  max_legs = 1;
+	if (max_legs > 12) max_legs = 12;
+
+	while (gone < dist - 0.10 && segs < max_legs && !mirror_aborted()) {
 		double L = (denom > 0.05) ? fixed * want_v / denom : dist;
 		// The first leg returns in about a millisecond, because the sled is not yet
 		// moving, so it measures nothing and its length is a guess. Make it a SHORT
@@ -1053,6 +1079,14 @@ static void grime_grind(int from_lba, int to_lba, double total_ms)
 		// cost, so it comes out at 4-6 mm/s and is heard as the drag dying away.
 		// If the remainder is less than another leg and a half, take it all now.
 		if (dist - gone < L * 1.5) L = dist - gone;
+
+		// Check before committing, and when the budget is gone just STOP. The first
+		// version of this tried to catch up by taking the whole remaining distance in
+		// one move, which costs more than the leg it was avoiding and took a 1923 ms
+		// drag to 5284 ms. Stopping short is harmless: the next transition seeks to an
+		// absolute target, and anything under SILENT_BELOW_MM is silent anyway.
+		if (segs > 0 && clock_ms() - grind_start + fixed + STEP_PER_MM_MS * L > total_ms)
+			break;
 
 		double st = clock_ms();
 		gone += L;
