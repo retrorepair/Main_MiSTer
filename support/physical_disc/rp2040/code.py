@@ -36,10 +36,17 @@
 #
 # WIRING
 #   The PS1 board stays whole on its own PSU. Cut the traces from the CD DSP to the
-#   driver IC's (IC722) input pins and drive those pads from the Pico. Tie Pico GND
-#   to PS1 GND. Drive IC722's MUTE / standby pins to ENABLED -- left floating once
-#   the DSP's traces are cut, the driver stays muted and nothing moves.
-#   If IC722 wants 5 V logic, put a 74HCT buffer between (HCT accepts 3.3 V in).
+#   driver IC's input pins and drive those pads from the Pico. Tie Pico GND to PS1
+#   GND. The 8 V supplies (pins 10, 19, 28) stay on the board: the Pico only ever
+#   drives logic-level inputs, and the IC swings 8 V to the motors.
+#
+#   HOLD PIN 20 (MUTE) AT ITS UN-MUTED LEVEL. It was driven by the CD DSP, so once
+#   that trace is cut it floats and the driver may stay muted -- which looks exactly
+#   like a wiring fault. Measure pin 20 on the running PS1 first and hold it there.
+#
+#   Logic level: those inputs were driven by the CD DSP, so they take whatever it
+#   ran at. Measure the DSP's Vcc -- 3.3 V means the Pico drives them directly, 5 V
+#   means a 74HCT buffer between (HCT accepts a 3.3 V input).
 
 import board
 import digitalio
@@ -48,10 +55,39 @@ import time
 
 # ---------------------------------------------------------------- configuration
 
-MODE        = "btl"          # "btl": 1 pin/motor, 50% duty = stop (BA5947FP class)
-                             # "hbridge": 2 pins/motor (L293D, DRV8833)
+# "hbridge" for the BA5977FP, confirmed from its pin table: each PWM channel has
+# TWO input pins, FIN and RIN, not one pin with 50% duty as centre. PWM on FIN with
+# RIN low drives forward, and the other way round for reverse. "btl" is kept for a
+# driver that really does take a single centred input.
+MODE        = "hbridge"      # "hbridge": 2 pins/motor (BA5977FP, L293D, DRV8833)
+                             # "btl":     1 pin/motor, 50% duty = stop
 
-SLED_PINS   = (board.GP2, board.GP3)    # btl: (pwm, unused). hbridge: (in1, in2)
+# For the BA5977FP these are (FIN, RIN) of whichever channel drives the sled.
+#
+#   BA5977FP, from the datasheet pin table
+#   ---------------------------------------------------------------
+#    1,2,27  OPIN-, OPIN+, OPOUT   spare op-amp
+#    3       SW                    ch4 input select (NOT a master enable)
+#    4,5     ch1FIN, ch1RIN        ch1 PWM in      ->  out 14, 13
+#    6,7     ch2FIN, ch2RIN        ch2 PWM in      ->  out 12, 11
+#    8,21    GND
+#    9       VrefIN                internal Vref
+#    10      PowVcc (ch1,2)        8 V, leave on the board
+#    11,12   ch2OUTR, ch2OUTF      ch2 motor
+#    13,14   ch1OUTR, ch1OUTF      ch1 motor
+#    15,16   ch4OUTR, ch4OUTF      ch4 motor
+#    17,18   ch3OUTF, ch3OUTR      ch3 motor
+#    19      PowVcc (ch3,4)        8 V, leave on the board
+#    20      MUTE                  hold at its un-muted level -- MEASURE IT on the
+#                                  running PS1 before cutting anything
+#    22,23   ch3RIN, ch3FIN        ch3 PWM in      ->  out 18, 17
+#    24,25,26 ch4IN, ch4CAPA, OUTVref   ch4 is ANALOGUE, not PWM
+#    28      PreVcc                8 V, leave on the board
+#
+# Buzz the motor connector to pins 11-18 to find which channel is the sled. If it
+# lands on ch1/ch2/ch3 it is a PWM pair and this code drives it directly. If it
+# lands on ch4 that channel wants a voltage, so a PWM-plus-RC filter is needed.
+SLED_PINS   = (board.GP2, board.GP3)    # hbridge: (FIN, RIN). btl: (pwm, unused)
 LIMIT_PIN   = board.GP6
 LIMIT_ACTIVE_LOW = True      # closed to ground when the sled is home
 
