@@ -53,6 +53,33 @@
 #   The traces to cut are between IC732 (CD DSP) and IC722 (DRIVER). The optical
 #   block is a KSM-440AEM; of its two connectors, the one going to IC723 CD-RF is
 #   the laser flex and can be ignored entirely -- the other is the motor connector.
+#
+#
+# WIRING FOR ch4, WHICH IS WHERE THE SLED TURNED OUT TO BE
+#
+#   The sled motor is on ch4OUTR/ch4OUTF (pins 15, 16). ch4 is the analogue channel,
+#   so it takes a VOLTAGE on pin 24, not a PWM pair. Turn the Pico's PWM into one
+#   with a low-pass filter:
+#
+#       GP2 ----[ 1k ]----+---- IC722 pin 24  (ch4IN)
+#                         |
+#                      [ 10uF ]
+#                         |
+#                        GND
+#
+#   1k and 10uF give a 10 ms time constant: ripple at 25 kHz is nothing, and 10 ms
+#   is far quicker than any gesture. Keep the series resistor low -- pin 24 sits
+#   behind resistors around 100k, so a 10k source would drop a noticeable fraction
+#   of the signal across itself. Exact values hardly matter otherwise, because duty
+#   is calibrated against measured velocity anyway.
+#
+#   Pin 26 (OUTVref) is the reference the output is compared against, and pin 25
+#   (ch4CAPA) is its external capacitor. BOTH ARE ALREADY FITTED on the board --
+#   leave them. Just measure pin 26 and set ANALOG_CENTRE = that voltage / 3.3.
+#
+#   Lift pins 24, 20 and 3 to disconnect the DSP, then drive all three from the Pico.
+#   Leave pins 10, 19, 28 (the 8 V rails), pins 25 and 26, and the motor connector
+#   exactly as they are.
 
 import board
 import digitalio
@@ -61,12 +88,23 @@ import time
 
 # ---------------------------------------------------------------- configuration
 
-# "hbridge" for the BA5977FP, confirmed from its pin table: each PWM channel has
-# TWO input pins, FIN and RIN, not one pin with 50% duty as centre. PWM on FIN with
-# RIN low drives forward, and the other way round for reverse. "btl" is kept for a
-# driver that really does take a single centred input.
-MODE        = "hbridge"      # "hbridge": 2 pins/motor (BA5977FP, L293D, DRV8833)
-                             # "btl":     1 pin/motor, 50% duty = stop
+# "analog" because the sled is on the BA5977FP's ch4, which is the odd channel out:
+# ONE input (pin 24, ch4IN) whose voltage is compared against an external reference
+# (pin 26, OUTVref). Above the reference drives one way, below drives the other, and
+# at the reference it stops. Channels 1-3 would have been a pair of PWM pins
+# ("hbridge"), which is easier -- ch4 needs the Pico's PWM turned into a DC level by
+# an RC filter first. See WIRING below.
+MODE        = "analog"       # "analog":  1 pin via RC filter, centred on ANALOG_CENTRE
+                             # "hbridge": 2 pins/motor (ch1-3, L293D, DRV8833)
+
+# Duty that lands the filtered output ON the reference, i.e. motor stopped. With a
+# 3.3 V PWM this is roughly OUTVref / 3.3 -- so measure pin 26 and divide. A reference
+# at 1.65 V gives 0.50; at 1.75 V gives 0.53. Getting this close matters: if the
+# "stopped" duty is off, the sled creeps whenever it should be still.
+ANALOG_CENTRE = 0.50
+
+# If the sled runs the wrong way, flip this rather than rewiring.
+INVERT_DIRECTION = False
 
 # For the BA5977FP these are (FIN, RIN) of whichever channel drives the sled.
 #
@@ -108,6 +146,13 @@ LIMIT_ACTIVE_LOW = True      # closed to ground when the sled is home
 MUTE_PIN          = board.GP7
 MUTE_UNMUTED_HIGH = True
 
+# Pin 3, SW: the BA5977FP's ch4 input switch, documented as H -> ON, L -> OFF. It did
+# not matter while the sled looked like it was on a PWM channel; it matters now,
+# because it gates the very channel being driven. Measure pin 3 on the running PS1
+# and match what you see.
+SW_PIN        = board.GP8
+SW_ON_HIGH    = True
+
 PWM_HZ      = 25000          # above the driver's internal filter, and above hearing
 
 # Tried in order, one per power-up. Coarse on purpose: this is a first look at
@@ -134,6 +179,12 @@ if MUTE_PIN is not None:
     _mute.direction = digitalio.Direction.OUTPUT
     _mute.value = MUTE_UNMUTED_HIGH
 
+# ch4's input switch, held on for as long as this runs.
+if SW_PIN is not None:
+    _sw = digitalio.DigitalInOut(SW_PIN)
+    _sw.direction = digitalio.Direction.OUTPUT
+    _sw.value = SW_ON_HIGH
+
 _a = pwmio.PWMOut(SLED_PINS[0], frequency=PWM_HZ, duty_cycle=0)
 _b = pwmio.PWMOut(SLED_PINS[1], frequency=PWM_HZ, duty_cycle=0)
 
@@ -147,17 +198,23 @@ def _u16(frac):
 
 
 def drive_inward(duty):
-    if MODE == "btl":
-        _a.duty_cycle = _u16(0.5 - duty * 0.5)   # below centre = inward
+    if MODE == "analog":
+        # Swing away from the reference. How far below (or above) sets the speed,
+        # and the headroom is whichever side of ANALOG_CENTRE is smaller.
+        span = min(ANALOG_CENTRE, 1.0 - ANALOG_CENTRE)
+        off  = duty * span
+        _a.duty_cycle = _u16(ANALOG_CENTRE + off if INVERT_DIRECTION
+                             else ANALOG_CENTRE - off)
         _b.duty_cycle = 0
     else:
-        _a.duty_cycle = 0
-        _b.duty_cycle = _u16(duty)
+        a, b = (duty, 0.0) if INVERT_DIRECTION else (0.0, duty)
+        _a.duty_cycle = _u16(a)
+        _b.duty_cycle = _u16(b)
 
 
 def coast():
-    if MODE == "btl":
-        _a.duty_cycle = _u16(0.5)                # centre = no drive
+    if MODE == "analog":
+        _a.duty_cycle = _u16(ANALOG_CENTRE)      # on the reference = stopped
         _b.duty_cycle = 0
     else:
         _a.duty_cycle = 0
