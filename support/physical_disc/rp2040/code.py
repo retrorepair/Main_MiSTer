@@ -97,6 +97,17 @@ SLED_PINS   = (board.GP2, board.GP3)    # hbridge: (FIN, RIN). btl: (pwm, unused
 LIMIT_PIN   = board.GP6
 LIMIT_ACTIVE_LOW = True      # closed to ground when the sled is home
 
+# Pin 20 of the BA5977FP. Driven by the CD DSP originally, so once that trace is
+# lifted it floats and the driver may sit muted -- which looks exactly like a wiring
+# fault. Let the Pico hold it instead of hard-wiring it: if the polarity turns out to
+# be the other way round, change the flag rather than the solder.
+#
+# Measure pin 20 on the running PS1 first and set MUTE_UNMUTED_HIGH to match what you
+# see while the drive is working normally. Set MUTE_PIN to None if you would rather
+# tie it to a rail by hand.
+MUTE_PIN          = board.GP7
+MUTE_UNMUTED_HIGH = True
+
 PWM_HZ      = 25000          # above the driver's internal filter, and above hearing
 
 # Tried in order, one per power-up. Coarse on purpose: this is a first look at
@@ -115,6 +126,13 @@ _led.direction = digitalio.Direction.OUTPUT
 _limit = digitalio.DigitalInOut(LIMIT_PIN)
 _limit.direction = digitalio.Direction.INPUT
 _limit.pull = digitalio.Pull.UP
+
+# Hold the driver un-muted for as long as this runs. Done before anything else, so
+# the very first motion attempt is not fighting a muted output stage.
+if MUTE_PIN is not None:
+    _mute = digitalio.DigitalInOut(MUTE_PIN)
+    _mute.direction = digitalio.Direction.OUTPUT
+    _mute.value = MUTE_UNMUTED_HIGH
 
 _a = pwmio.PWMOut(SLED_PINS[0], frequency=PWM_HZ, duty_cycle=0)
 _b = pwmio.PWMOut(SLED_PINS[1], frequency=PWM_HZ, duty_cycle=0)
