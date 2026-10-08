@@ -29,6 +29,8 @@
 #   3 slow blinks, then solid during the run
 #   N blinks after        -- run recorded, N = how many runs are now stored
 #   solid on              -- all duties done, nothing left to do
+#   2 long, repeating     -- FIRST POWER-UP ONLY: direction found and saved. The sled is
+#                            now on the switch: wind it back out and power up again.
 #   5 fast, repeating     -- sled was already at the inner switch: wind it out first
 #   long-short, repeating -- never reached the switch: stalled, or the duty is too low
 #   continuous fast blink -- filesystem is read-only: you are plugged into a PC
@@ -55,31 +57,32 @@
 #   the laser flex and can be ignored entirely -- the other is the motor connector.
 #
 #
-# WIRING FOR ch4, WHICH IS WHERE THE SLED TURNED OUT TO BE
+# WIRING (BA5977FP, IC722). The channel map is from Sony's own PSone service manual
+# schematic: it follows each IC output to the 4-pin motor plug CN701.
 #
-#   The sled motor is on ch4OUTR/ch4OUTF (pins 15, 16). ch4 is the analogue channel,
-#   so it takes a VOLTAGE on pin 24, not a PWM pair. Turn the Pico's PWM into one
-#   with a low-pass filter:
+#     SLED    = ch3  outputs pins 17/18, INPUTS pins 22 (RIN) and 23 (FIN)  <- this code
+#     SPINDLE = ch4  outputs pins 15/16, input pin 24 (analogue)
+#     ch1/ch2 = focus / tracking coils, via the laser flex. Leave pins 4-7 alone.
 #
-#       GP2 ----[ 1k ]----+---- IC722 pin 24  (ch4IN)
-#                         |
-#                      [ 10uF ]
-#                         |
-#                        GND
+#   Pico  GP4  ->  IC722 pin 23   sled forward input
+#   Pico  GP5  ->  IC722 pin 22   sled reverse input
+#   Pico  GP7  ->  IC722 pin 20   MUTE: high = running (the schematic shows 3.3 V)
+#   Pico  GP8  ->  IC722 pin 3    SW: held LOW (the schematic shows 0 V)
+#   Pico  GP2  ->  1k -> pin 24 (+ 10uF to GND)   spindle, parked on its reference
+#   Pico  GP6  ->  limit switch, other side to GND
+#   Pico  GND  ->  PS1 GND
 #
-#   1k and 10uF give a 10 ms time constant: ripple at 25 kHz is nothing, and 10 ms
-#   is far quicker than any gesture. Keep the series resistor low -- pin 24 sits
-#   behind resistors around 100k, so a 10k source would drop a noticeable fraction
-#   of the signal across itself. Exact values hardly matter otherwise, because duty
-#   is calibrated against measured velocity anyway.
+#   Lift pins 22, 23, 20, 3 and 24, and solder to the IC's LEG, not to the pad: the pad
+#   still leads to the CD DSP's trace and the signal never reaches the chip.
+#   Pin 20 sits between GND (21) and the 7.4 V rail (19) -- check for a bridge.
+#   Do NOT connect pins 17/18 (outputs), 4-7, or 10/19/28 (the 8 V rails).
 #
-#   Pin 26 (OUTVref) is the reference the output is compared against, and pin 25
-#   (ch4CAPA) is its external capacitor. BOTH ARE ALREADY FITTED on the board --
-#   leave them. Just measure pin 26 and set ANALOG_CENTRE = that voltage / 3.3.
+#   FIRST POWER-UP finds the sled's direction itself and saves it to /dir.txt, so there
+#   is no polarity to get right in advance. See main().
 #
-#   Lift pins 24, 20 and 3 to disconnect the DSP, then drive all three from the Pico.
-#   Leave pins 10, 19, 28 (the 8 V rails), pins 25 and 26, and the motor connector
-#   exactly as they are.
+#   Normal operating voltages from the same schematic, for comparing a meter against:
+#   MUTE(20) 3.3 V, SW(3) 0 V, PowVcc/PreVcc(10,19,28) 7.4 V, VrefIN(9) 3.3 V,
+#   ch4IN(24) 1.9 V, OUTVref(26) 1.7 V, ch3 inputs(22,23) about 0 V.
 
 import board
 import digitalio
@@ -88,22 +91,18 @@ import time
 
 # ---------------------------------------------------------------- configuration
 
-# "analog" because the sled is on the BA5977FP's ch4, which is the odd channel out:
-# ONE input (pin 24, ch4IN) whose voltage is compared against an external reference
-# (pin 26, OUTVref). Above the reference drives one way, below drives the other, and
-# at the reference it stops. Channels 1-3 would have been a pair of PWM pins
-# ("hbridge"), which is easier -- ch4 needs the Pico's PWM turned into a DC level by
-# an RC filter first. See WIRING below.
-MODE        = "analog"       # "analog":  1 pin via RC filter, centred on ANALOG_CENTRE
-                             # "hbridge": 2 pins/motor (ch1-3, L293D, DRV8833)
+# "hbridge": the sled is on ch3, which is a plain FIN/RIN pair of PWM inputs. PWM on
+# FIN with RIN low drives one way, the other way round drives the other, and both low
+# is stopped. No filter, reference or SW pin needed. (An earlier version of this file
+# drove ch4 in "analog" mode because I took "ch4 is the sled" on trust. The schematic
+# says ch4 is the SPINDLE. "analog" is kept for reference but is not used.)
+MODE        = "hbridge"      # "hbridge": 2 pins, FIN/RIN. "analog": 1 pin + RC filter
 
-# Duty that lands the filtered output ON the reference, i.e. motor stopped. With a
-# 3.3 V PWM this is roughly OUTVref / 3.3 -- so measure pin 26 and divide. A reference
-# at 1.65 V gives 0.50; at 1.75 V gives 0.53. Getting this close matters: if the
-# "stopped" duty is off, the sled creeps whenever it should be still.
-ANALOG_CENTRE = 0.50
+# Only used in "analog" mode. 1.7 V (Sony's OUTVref) / 3.3 V.
+ANALOG_CENTRE = 0.515
 
-# If the sled runs the wrong way, flip this rather than rewiring.
+# Which way is "inward" is found by the first power-up and stored in /dir.txt, then
+# loaded into this. False/True are only the starting point.
 INVERT_DIRECTION = False
 
 # For the BA5977FP these are (FIN, RIN) of whichever channel drives the sled.
@@ -131,7 +130,7 @@ INVERT_DIRECTION = False
 # Buzz the motor connector to pins 11-18 to find which channel is the sled. If it
 # lands on ch1/ch2/ch3 it is a PWM pair and this code drives it directly. If it
 # lands on ch4 that channel wants a voltage, so a PWM-plus-RC filter is needed.
-SLED_PINS   = (board.GP2, board.GP3)    # hbridge: (FIN, RIN). btl: (pwm, unused)
+SLED_PINS   = (board.GP4, board.GP5)    # (FIN, RIN) = IC722 pins 23, 22  (ch3)
 LIMIT_PIN   = board.GP6
 LIMIT_ACTIVE_LOW = True      # closed to ground when the sled is home
 
@@ -146,12 +145,16 @@ LIMIT_ACTIVE_LOW = True      # closed to ground when the sled is home
 MUTE_PIN          = board.GP7
 MUTE_UNMUTED_HIGH = True
 
-# Pin 3, SW: the BA5977FP's ch4 input switch, documented as H -> ON, L -> OFF. It did
-# not matter while the sled looked like it was on a PWM channel; it matters now,
-# because it gates the very channel being driven. Measure pin 3 on the running PS1
-# and match what you see.
+# Pin 3, SW: ch4's input switch only (the spindle), so it does not gate the sled. Sony's
+# schematic shows 0 V on it in normal operation, so it is held LOW, which is the state
+# the PS1 itself runs in. (Set SW_PIN to None to leave it to a hard wire.)
 SW_PIN        = board.GP8
-SW_ON_HIGH    = True
+SW_ON_HIGH    = False
+
+# Spindle: ch4, pin 24 through the RC, parked ON its reference so it stays still while
+# the sled is being measured. Sony's schematic shows OUTVref at 1.7 V: 1.7 / 3.3.
+SPINDLE_PIN       = board.GP2
+SPINDLE_STOP_DUTY = 0.515
 
 PWM_HZ      = 25000          # above the driver's internal filter, and above hearing
 
@@ -197,6 +200,11 @@ def _u16(frac):
     return int(frac * 65535)
 
 
+# Hold the spindle still for as long as this runs. Without a PWM output on GP2 the
+# RC would float and ch4 could wander off its reference.
+_spindle = pwmio.PWMOut(SPINDLE_PIN, frequency=PWM_HZ, duty_cycle=_u16(SPINDLE_STOP_DUTY))
+
+
 def drive_inward(duty):
     if MODE == "analog":
         # Swing away from the reference. How far below (or above) sets the speed,
@@ -222,7 +230,11 @@ def coast():
 
 
 def at_home():
-    return (not _limit.value()) if LIMIT_ACTIVE_LOW else _limit.value()
+    # .value is a PROPERTY in CircuitPython, not a method as it is in MicroPython.
+    # This used to read _limit.value() and raised "'bool' object is not callable" the
+    # first time it ran, which killed code.py silently right after it created an empty
+    # results.csv. No test was ever run. Carried over from the MicroPython version.
+    return (not _limit.value) if LIMIT_ACTIVE_LOW else _limit.value
 
 
 # --------------------------------------------------------------------- led codes
@@ -271,7 +283,8 @@ def append_result(duty, ms):
     new = False
     try:
         with open(RESULTS) as f:
-            f.read(1)
+            if not f.read(1):
+                new = True           # the file exists but is empty
     except OSError:
         new = True
     with open(RESULTS, "a") as f:
@@ -280,11 +293,50 @@ def append_result(duty, ms):
         f.write("%.2f,%d,%s\n" % (duty, ms, "ok" if ms > 0 else "stalled"))
 
 
+# ------------------------------------------------------------------ direction
+
+DIRFILE = "/dir.txt"
+
+
+def load_direction():
+    """True/False once the first power-up has found it, None before that."""
+    try:
+        with open(DIRFILE) as f:
+            return f.read().strip() == "1"
+    except OSError:
+        return None
+
+
+def save_direction(inverted):
+    with open(DIRFILE, "w") as f:
+        f.write("1" if inverted else "0")
+
+
+def try_direction(inverted, seconds, duty=0.45):
+    """Drive with this polarity and report whether the limit switch closed.
+
+    The sled starts at the OUTER end, so only genuine inward travel can reach the
+    switch. That makes the switch an unambiguous test of which polarity is inward.
+    """
+    global INVERT_DIRECTION
+    INVERT_DIRECTION = inverted
+    start = time.monotonic()
+    try:
+        drive_inward(duty)
+        while time.monotonic() - start < seconds:
+            if at_home():
+                return True
+            time.sleep(0.001)
+        return False
+    finally:
+        coast()
+
+
 # ------------------------------------------------------------------------- main
 
 def main():
+    global INVERT_DIRECTION
     coast()
-    done = read_results()
 
     # Writable? If not we are plugged into a PC, and this run cannot be recorded.
     try:
@@ -292,6 +344,34 @@ def main():
             pass
     except OSError:
         forever([(0.06, 0.06)])          # continuous fast blink
+
+    inverted = load_direction()
+    if inverted is None:
+        # FIRST POWER-UP EVER: find which polarity is inward, so nothing has to be
+        # guessed or swapped. Start with the sled wound to the OUTER stop.
+        if at_home():
+            forever([(0.07, 0.07)] * 5)  # 5 fast: the sled is already on the switch
+        blink(3, 0.25, 0.25)
+        time.sleep(SETTLE_S)
+        _led.value = True
+        found = None
+        if try_direction(False, 7.0):
+            found = False
+        else:
+            time.sleep(0.5)
+            if try_direction(True, 12.0):
+                found = True
+        _led.value = False
+        if found is None:
+            # Nothing reached the switch either way: not driven, or switch unwired.
+            forever([(0.6, 0.15), (0.12, 0.6)])     # long-short
+        save_direction(found)
+        # Two long blinks, repeating: direction saved. The sled is now ON the switch,
+        # so wind it back out to the outer stop and power up again to start the table.
+        forever([(0.5, 0.3), (0.5, 1.0)])
+    INVERT_DIRECTION = inverted
+
+    done = read_results()
 
     if len(done) >= len(DUTIES):
         _led.value = True                # solid: nothing left to do
