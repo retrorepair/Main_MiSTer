@@ -50,7 +50,7 @@ while True:
         c = p[0]
         if c == "PING": out("OK servo 1")
         elif c == "STOP": known = known; out("OK")
-        elif c == "SPIN": out("OK")
+        elif c == "SPIN" or c == "TEX": out("OK")
         elif c == "HOME":
             out("OK"); known = True; pos = 0
             later(0.6, "DONE HOME 0 600 home")

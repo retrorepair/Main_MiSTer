@@ -38,7 +38,7 @@ static const acu_drive_t drives[PD_ACU_PROFILE_COUNT] = {
 	// SLED_FIXED_COST 0.05 s plus SLED_VARIABLE_COST up to 0.9 s total, and
 	// spin-up is one second. It also only engages the sled past 7200 sectors,
 	// which is roughly 300 turns at mid-disc -- hence the lower break here.
-	{ "PSX",       2.0, 1.0,  32,  300,   25,   100,   900,  1000, 0,     8, 1,   3 },
+	{ "PSX",       2.0, 1.0,  32,  300,   25,   100,   900,  1000, 0,     8, 2,   3 },
 	// Mega CD / Sega CD: 1x only, slow sled, spins down when left idle.
 	// base 160 ms and stroke 1500 ms are Genesis Plus GX's documented figures
 	// (2 + 10 interrupts base; "max. seek time = 1.5 s" across 270000 sectors),
@@ -351,6 +351,14 @@ void acu_model_event(acu_model_t *m, double now_ms, pd_acoustic_event_t ev, int 
 				g.stages    = 2;
 				g.radial_mm = CD_R_OUTER_MM - CD_R_INNER_MM;
 				g.rpm       = cd_geom_rpm(0, d->data_speed);
+				if (d->calib_sweep == 2) {
+					// The PlayStation's CXD2545Q has an SSTP pin, "disc innermost track
+					// detect" (datasheet p.6), and its start-up is: sled to the hub, focus
+					// search, gain adjust, spindle kick, TOC. There is no sweep of the whole
+					// stroke in that, so it just homes, taking up to one stroke.
+					g.home_only = 1;
+					g.dur_ms    = d->full_stroke_ms;
+				}
 				emit(m, &g);
 				m->head_lba = 0;
 			}

@@ -39,7 +39,10 @@ static struct {
 	double spin_rpm;           // what the board was last told
 	int    pos_pm;             // where it was last told to put the sled
 	int    timeouts;
-} rig = { -1 };
+
+	int    want_smooth;       // drive style the current profile wants
+	int    sent_smooth;       // the style the board was last told (-1 = not yet)
+} rig = { -1, {0}, 0, {0}, 0, 0, 0, 0, 0, 0, -1 };
 
 static void (*g_log)(const char *line);
 
@@ -215,6 +218,7 @@ int rig_connect(void)
 			cmd("STOP", REPLY_MS);
 			rig.spin_rpm = 0.0;
 			rig.pos_pm   = 0;
+			rig.sent_smooth = -1;
 			rlog("rig: %s answered \"%s\"\n", path, who);
 			printf("physical_disc_acoustic: noise rig found on %s (%s)\n", path, who);
 			return 0;
@@ -307,9 +311,26 @@ static int do_move(int pm, double dur_ms, double t0, int (*aborted)(void), int a
 	return strncmp(r, "OK", 2) ? -1 : 0;
 }
 
+void rig_set_profile(int profile)
+{
+	// The PlayStation's sled is driven by a plain, high-frequency PWM at a fixed level (CXD2545Q p.78)
+	// and sounds like a clean whirr. The Mega CD's rough drag is the Mega CD's own.
+	rig.want_smooth = (profile == PD_ACU_PROFILE_PSX) ? 1 : 0;
+}
+
+// Make the board's drive style match the profile; costs one command, and only when it has changed.
+static void sync_style(void)
+{
+	if (rig.sent_smooth == rig.want_smooth) return;
+	char line[32];
+	snprintf(line, sizeof(line), "TEX smooth %d", rig.want_smooth);
+	if (cmd(line, REPLY_MS)) rig.sent_smooth = rig.want_smooth;
+}
+
 void rig_play(const gesture_t *g, int (*aborted)(void))
 {
 	if (rig.fd < 0) return;
+	sync_style();
 
 	double t0  = now_ms();
 	double dur = g->dur_ms;
@@ -365,6 +386,10 @@ void rig_play(const gesture_t *g, int (*aborted)(void))
 	case GEST_SWEEP: {
 		// The deck calibrates: in to the hub, out to the rim, back. Two equal legs after the homing.
 		if (do_home(aborted) != 0) break;
+		if (g->home_only) {   // a PlayStation only finds its innermost track
+			wait_until(end, aborted);
+			break;
+		}
 		double left = dur - (now_ms() - t0);
 		if (left < 400.0) break;
 		double leg = left / 2.0;

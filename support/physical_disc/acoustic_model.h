@@ -37,6 +37,7 @@ typedef struct {
 	double born_ms;         // when the model emitted this, for staleness
 	int    sectors;         // for STREAM: how far it runs before re-evaluating
 	int    audio;           // STREAM is Red Book audio, not a data read
+	int    home_only;       // SWEEP: just find the hub (the PlayStation does not sweep the stroke)
 } gesture_t;
 
 typedef struct {
@@ -51,7 +52,7 @@ typedef struct {
 	int    spinup_ms;
 	int    spindown_idle_ms;  // idle time before the spindle gives up
 	int    readahead_sectors; // drive buffer: how much it grabs per burst
-	int    calib_sweep;       // sweeps the sled when a disc is loaded
+	int    calib_sweep;       // on a disc load: 0 nothing, 1 sweep the stroke, 2 only home the sled
 	int    lock_revs;         // revolutions spent acquiring before audio starts
 } acu_drive_t;
 

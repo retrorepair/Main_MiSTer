@@ -25,6 +25,11 @@ void rig_disconnect(int park);
 // waiting and ends the wait early when it returns non-zero.
 void rig_play(const gesture_t *g, int (*aborted)(void));
 
+// Tell the rig which console's drive is being imitated (a pd_acoustic_profile_t). The PlayStation's
+// sled is driven smoothly, with a kick and a brake, where the Mega CD's is a rough drag, so the board's
+// drive style follows the profile.
+void rig_set_profile(int profile);
+
 // Optional trace sink; the player points this at its own log.
 void rig_set_log(void (*fn)(const char *line));
 

@@ -1781,6 +1781,7 @@ static void *worker_main(void *arg)
 			applied_profile = mir.profile_req;
 			acu_model_init(&model, (pd_acoustic_profile_t)applied_profile);
 			printf("physical_disc_acoustic: imitating the %s drive\n", model.drive.name);
+			rig_set_profile(applied_profile);
 
 			// A profile change means a core has just mounted a disc, so this is
 			// the moment that deck calibrates. It also has to be re-issued here

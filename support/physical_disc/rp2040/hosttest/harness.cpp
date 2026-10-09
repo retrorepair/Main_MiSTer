@@ -25,11 +25,14 @@ static void drain(const char *what)
 	}
 }
 
-int main(void)
+int main(int argc, char **argv)
 {
 	rig_set_log(logsink);
 	if (rig_connect()) { printf("no board\n"); return 1; }
-	acu_model_init(&m, PD_ACU_PROFILE_MEGACD);
+	// ./rigtest psx plays the PlayStation profile; the default is the Mega CD
+	pd_acoustic_profile_t prof = (argc > 1 && !strcmp(argv[1], "psx")) ? PD_ACU_PROFILE_PSX : PD_ACU_PROFILE_MEGACD;
+	rig_set_profile(prof);
+	acu_model_init(&m, prof);
 
 	double t = 1000.0;
 	// power-on: tray closes, TOC read

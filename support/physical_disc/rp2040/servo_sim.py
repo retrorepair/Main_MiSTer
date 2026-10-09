@@ -197,6 +197,13 @@ check("DRIVE out runs for the time asked and moves the sled", W.pos > 0.05 and n
 r = send("DRIVE in 0.5 3000", 0.05); advance(1.5)
 check("DRIVE in stops on the switch", W.pos == 0.0 and not ns["mv"])
 
+# The smooth option: the same MOVE with the plain drive, ended by the (dead-reckoned) target.
+send("HOME", 0.05); advance(6.0)
+send("TEX smooth 1")
+r = send("MOVE 500 800", 0.05); advance(1.2)
+check("smooth MOVE reaches roughly the target", 0.25 < W.pos < 0.9 and not ns["mv"], "true %.3f" % W.pos)
+send("TEX smooth 0")
+
 send("STOP")
 check("STOP mutes and parks", W.muted_driver and abs(W.spin - 0.515) < 0.01)
 

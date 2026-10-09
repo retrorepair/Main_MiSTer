@@ -75,6 +75,15 @@ TEX = {
     "amp": 0.03,        # swell depth, in duty
     "grit": 0.12,       # random duty noise
     "bias": 0.0,        # added to every textured duty
+    "kick_ms": 12.0,    # smooth moves start with a kick: the datasheet's sled kick (CXD2545Q p.30) is
+    "kick_gain": 2.0,   # basic level x1..x4 for 2.9..23.2 ms. The levels here are a first guess
+    "brake_ms": 10.0,   # until a real PS1 is captured; the brake is the reverse pulse that ends a jump
+    "smooth_min_v": 0.25,  # the smooth drive stalls below ~0.2 strokes/s, so slower moves stay textured
+    "eff_smooth": 1.23,     # the smooth drive's real speed against the table, measured outward with a
+                            # 620 ms move: 0.63 of the stroke travelled for 0.52 asked
+    "eff_smooth_in": 1.07,  # and inward, extra: 0.63 came home in 560 ms for 600 asked
+    "smooth": 0.0,      # 1 = move the sled with the plain 25 kHz drive (a clean whirr, no grind): what a
+                        # PlayStation or Saturn sled sounds like, against the Mega CD's grimy drag
     "eff": 1.04,        # scales the textured speed the firmware believes. From six repeats of
                         # MOVE 700 1971 with this texture: 0.73 of the stroke travelled, 0.70 asked.
     "eff_in": 1.14,     # the same, extra, for INWARD moves: the sled comes home about 19% faster
@@ -126,6 +135,18 @@ def speed_tex(d):
         if d <= d1:
             return s0 + (s1 - s0) * (d - d0) / (d1 - d0)
     return c[-1][1]
+
+
+def duty_for_plain(v):
+    """The duty that gives the SMOOTH drive v strokes per second (it stalls below about 0.15)."""
+    lo, hi = 0.15, 1.0
+    for _ in range(22):
+        mid = (lo + hi) / 2.0
+        if speed_at(mid) < v:
+            lo = mid
+        else:
+            hi = mid
+    return hi
 
 
 def duty_for(v):
@@ -254,11 +275,12 @@ class Mv:
     pass
 
 
-def start_move(kind, outward, target, d_cmd, T, plain, limit_s):
+def start_move(kind, outward, target, d_cmd, T, plain, limit_s, k=1.0):
     global mv
     m = Mv()
     m.kind, m.outward, m.target, m.d = kind, outward, target, d_cmd
     m.T, m.plain, m.limit_s = T, plain, limit_s
+    m.k = k                    # real speed over the planned speed, for dead reckoning
     m.t0 = time.monotonic_ns()
     m.last = m.t0
     m.p0 = pos
@@ -270,6 +292,11 @@ def finish(reason):
     global mv, known, pos
     m = mv
     mv = None
+    if reason == "target" and m.plain and m.kind == "move":
+        # The jump ends with a reverse kick (CXD2545Q p.57-61: brake B / kick D) before the
+        # servo takes over, which is the click at the end of a PlayStation seek.
+        drive(not m.outward, m.d)
+        time.sleep(TEX["brake_ms"] / 1000.0)
     coast()
     ms = int((time.monotonic_ns() - m.t0) / 1000000)
     if reason == "time" and (m.kind == "home" or m.target <= 0.0):
@@ -319,9 +346,15 @@ def cmd_move(args):
     wake()
     outward = target > pos
     v = dist / T
-    d = duty_for(v / (TEX["eff"] * (1.0 if outward else TEX["eff_in"])))
+    plain = TEX["smooth"] >= 0.5 and v >= TEX["smooth_min_v"]
+    k = 1.0
+    if plain:
+        k = TEX["eff_smooth"] * (1.0 if outward else TEX["eff_smooth_in"])
+        d = duty_for_plain(v / k)
+    else:
+        d = duty_for(v / (TEX["eff"] * (1.0 if outward else TEX["eff_in"])))
     limit_s = T + (3.0 if target == 0.0 else 0.4)
-    start_move("move", outward, target, d, T, False, limit_s)
+    start_move("move", outward, target, d, T, plain, limit_s, k)
     say("OK %d %d" % (int(pos * 1000), int(target * 1000)))
 
 
@@ -456,13 +489,15 @@ def step():
         m.last = ns
         if m.plain:
             d = m.d
+            if m.kind == "move" and el * 1000.0 < TEX["kick_ms"]:
+                d = min(1.0, m.d * TEX["kick_gain"])
         else:
             env = 0.5 * (1.0 + math.sin(6.2831853 * TEX["swell"] * el))
             d = (m.d + TEX["bias"] - TEX["amp"] + 2.0 * TEX["amp"] * env
                  + TEX["grit"] * (random.random() * 2.0 - 1.0))
         drive(m.outward, d)
         if m.plain:
-            v = speed_at(d)
+            v = speed_at(m.d) * m.k
         else:
             v = speed_tex(m.d + TEX["bias"]) * TEX["eff"] * (1.0 if m.outward else TEX["eff_in"])
         pos += (v * dt) if m.outward else -(v * dt)
