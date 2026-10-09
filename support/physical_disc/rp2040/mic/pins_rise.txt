@@ -1,0 +1,8 @@
+import board, digitalio, time, microcontroller
+def rise(n): d = digitalio.DigitalInOut(getattr(board, n)); d.switch_to_output(value=False); time.sleep(0.2); d.switch_to_input(pull=digitalio.Pull.UP); t0 = time.monotonic_ns(); vals = [d.value for _ in range(3000)]; t = (time.monotonic_ns() - t0) // 1000; k = vals.index(True) if True in vals else -1; d.deinit(); return (k, t)
+
+print("RISE name (read index at which the released-low line first reads high, -1 never; total us)")
+for n in ["GP2", "GP4", "GP5", "GP8", "GP10"]: print("RISE", n, rise(n), rise(n))
+
+print("RISE done")
+microcontroller.reset()

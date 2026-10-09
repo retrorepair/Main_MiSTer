@@ -408,6 +408,21 @@ table, the bench tools, and how gestures map to commands. Code: `rp2040/servo_fw
 The MiSTer's `[MegaCD]` section already has the two keys; the binary is deployed. What is
 left is the end-to-end listen with the Pico on the MiSTer's USB.
 
+## 2026-10-10: the lens orchestra, a microphone, and two open wires
+
+* Firmware: `LENS ... Z` (broadband noise, PIO + DMA), `LENS ... G` (triangle or sine tone), `SPIN` kick, a 15 s
+  host-silence watchdog (a core that exits no longer leaves the spindle or noise running), verified streaming
+  deploy in `picotool.py` (the old REPL upload dropped characters and then ran out of RAM at 31 KB).
+* Translator: per-console `lens_policy`; boot lens sequence once per disc; keepalive PING every 2 s while idle.
+* All of it is in `SERVO_RIG.md` ("The lens orchestra", "Open wires"). Deployed: Pico firmware CRC 0xf746a0e7,
+  MiSTer binary md5 4f90c214..., both on the MiSTer; core left at the menu.
+* **The sled and spindle do not move because GP4 and GP2 are not connected** (probe results in SERVO_RIG.md). Fix
+  the joints first, then re-run `rec.py` + `pattern.py` + `pattern_analysis.py`: with the spindle on versus off
+  there must be a measurable difference, and the 1-4 kHz body of the real console's sound has to come from those
+  two. Until then the PlayStation/Mega CD comparison is lens-only.
+* Needs the owner: sine or triangle for the tone; whether the steady PlayStation noise (level 2 at 8 kHz, tuned
+  by band level against the recording) sounds right by ear.
+
 ## Open
 
 * **Needs ears, not measurement.** Whether 3–4 contiguous segments across the

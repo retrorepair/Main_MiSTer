@@ -353,6 +353,50 @@ BTL buffers drive the load. So:
   to the FOCUS coil, the opposite of what the line nesting on the PSone schematic suggested. Not yet
   settled for this board; the first test that moves the lens should say which axis each channel is.
 
+### The lens orchestra: what is sourced, what is measured, what is a guess (2026-10-09/10)
+
+The board can also play the pickup's lens coils (`LENS ... Z` broadband noise, `LENS ... G` a 1 kHz tone) and
+kick the spindle (`SPIN rpm ms kick_ms`). `physical_disc_rig.cpp` has a per-console `lens_policy` table
+(focus-search ramp length, the PlayStation's auto-gain tone, steady servo noise, seek noise, relock burst,
+spindle kick). Sources: the Mega CD 2 service manual p.10 start-up order and focus search of about 2 s; the
+Saturn manual's "approx. 3 seconds" of lens movement; the CXD2545Q datasheet (KICK, tracking servo open during a
+sled move, AGCNTL's 1 kHz sine); a recording of a real PlayStation (tone at 1004 Hz for 0.4 s at 3.15 s). The
+levels, lengths and which console does what are **best guesses**. The start-up lens sequence plays once per disc
+and not under the generic profile (the core announces the mount several times).
+
+**Microphone measurements** (`rp2040/mic/`: `rec.py` records the PC's default microphone through winmm with
+ctypes, the analysis scripts run in WSL with numpy). A microphone beside the rig, in a room that is not silent:
+
+* The pickup radiates the lens drive almost entirely at 4-14 kHz whatever the pulse rate of the noise (64 kHz
+  down to 2 kHz, level 2): nothing measurable below 2 kHz. A lower rate only raises the 4-11 kHz level. This is
+  the owner's "dog whistle" description.
+* A real PlayStation reading is +20 to +26 dB over its idle floor at 1-3 kHz (the mechanics: spindle, sled,
+  gears), +14.5 dB at 4-6 kHz, +12 dB at 6-11 kHz. The rig's steady noise (level 2, 8 kHz pulses) gives +9, +9 and
+  +13 dB at 4-6, 6-8 and 8-11 kHz, so the lens part is the right order; **the 1-4 kHz body of the real sound has
+  to come from the sled and spindle**, which were not working when this was measured.
+* The 1 kHz tone: the recording's line is +12 to +17 dB over its surroundings with no harmonics. The rig's
+  triangle at peak 0.5 gives +14 dB at 1 kHz but its third harmonic (3 kHz) reads +23 to +27 dB, because the
+  pickup radiates 3 kHz far better than 1 kHz. A sine ("s", `BEEP_SHAPE` in the translator) brings 3 kHz down to
+  about equal to 1 kHz. The triangle is the default because the owner asked for "more triangle than square".
+
+### Open wires found by probing from the Pico (2026-10-10)
+
+Sled and spindle did not move at all, with the old and the new firmware and with raw PWM from the REPL; the lens
+channels worked at the same time (so the chip is powered and unmuted). Probing the Pico's own pins
+(`rp2040/mic/pins_*.txt`, run with `picotool.py repl --file`):
+
+* Held-high pin released: GP5 (sled RIN), GP7 (MUTE) and GP10-13 (lens) fall at once (a low-impedance path to
+  ground, as the chip's inputs have). **GP4 (sled FIN, IC722 pin 23) and GP2 (spindle RC, pin 24) hold their level
+  for over 3 ms: nothing is connected there.**
+* Released-low pin with the pull-up on: GP2 reads high on the very first read; a connected 0.22 uF filter would
+  take about 10 ms. So the RC is not on GP2's net either.
+* Which fits everything seen: HOME works (it drives RIN, GP5), every outward move ends as `stuck` (it needs FIN,
+  GP4), the spindle never turns, and the earlier "sled stuck at the hub for an hour" (probably the same loose
+  joint, intermittent).
+* To confirm: continuity from the Pico GP4 pad to IC722 pin 23, and GP2 to the RC and on to pin 24, with the
+  power off. GP5, the neighbour of GP4, is fine, so a loose jumper in the Pico's header or a lifted joint at the
+  chip are the likely places.
+
 ### Still open
 
 * Spindle duty to rpm is set by ear, not measured: stepping 0.53-0.62 was smooth and 0.66 and

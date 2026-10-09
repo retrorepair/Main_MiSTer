@@ -1,0 +1,9 @@
+import board, digitalio, time, microcontroller
+P = ["GP2", "GP4", "GP5", "GP6", "GP7", "GP8", "GP10", "GP11", "GP12", "GP13"]
+def rd(n, pull): d = digitalio.DigitalInOut(getattr(board, n)); d.switch_to_input(pull=pull); time.sleep(0.02); v = int(d.value); d.deinit(); return v
+
+print("PINS name pullup pulldown none")
+for n in P: print("PIN", n, rd(n, digitalio.Pull.UP), rd(n, digitalio.Pull.DOWN), rd(n, None))
+
+print("PINS done")
+microcontroller.reset()

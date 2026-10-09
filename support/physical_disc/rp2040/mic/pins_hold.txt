@@ -1,0 +1,9 @@
+import board, digitalio, time, microcontroller
+P = ["GP2", "GP4", "GP5", "GP7", "GP8", "GP10", "GP11", "GP12", "GP13"]
+def hold(n): d = digitalio.DigitalInOut(getattr(board, n)); d.switch_to_output(value=True); time.sleep(0.05); d.switch_to_input(pull=None); t0 = time.monotonic_ns(); vals = [d.value for _ in range(300)]; t = (time.monotonic_ns() - t0) // 1000; d.deinit(); return (vals.index(False) if False in vals else 300, t)
+
+print("HOLD name (reads still high out of 300, total microseconds for 300 reads)")
+for n in P: print("HOLD", n, hold(n), hold(n))
+
+print("HOLD done")
+microcontroller.reset()
