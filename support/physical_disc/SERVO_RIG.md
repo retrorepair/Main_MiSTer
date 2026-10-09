@@ -220,3 +220,97 @@ Normal idle voltages: MUTE(20) 3.3 V, SW(3) 0 V, PowVcc 7.4 V, OUTVref(26) 1.7 V
    "'bool' object is not callable" and silently killed code.py right after it created an
    empty results.csv. A stubbed test that never called the function could not see it.
 2. "ch4 is the sled" was taken on trust. The schematic says ch4 is the spindle.
+
+## The rig as built
+
+### Wiring (RP2040 Pico, 3.3 V logic straight into the PS1's DIG3.5V-powered IC722)
+
+| Pico | IC722 pin | function |
+|------|-----------|----------|
+| GP4  | 23 | ch3 FIN, sled PWM |
+| GP5  | 22 | ch3 RIN, sled PWM |
+| GP7  | 20 | MUTE, high = run |
+| GP8  | 3  | SW, held low |
+| GP2  | 24 (via the board's own 4.7k + 0.22uF) | ch4 IN, spindle, analogue-ish |
+| GP6  | limit switch to GND | closed = sled at the hub |
+
+The PS1 keeps its own PSU. `/dir.txt` on the board holds the sled polarity (0 = FIN carries
+outward); `DIR 0|1` changes and saves it.
+
+### Firmware and protocol (`rp2040/servo_fw.py`, deployed as `/code.py`)
+
+`boot.py` enables a second USB serial port. On Windows the console is COM5 and the data
+port COM6; on the MiSTer they are two `/dev/ttyACM*`, and `rig_connect()` finds the data one
+by sending PING and looking for "OK servo". One ASCII line per command, one reply line each:
+
+    PING | ST | HOME [duty] | MOVE <permille> <ms> | SPIN <rpm> <ms> | DRIVE <out|in> <duty> <ms>
+    TEX <name> <value> | MUTE 0|1 | DIR 0|1 | STOP | RESET
+
+`MOVE` and `HOME` reply at once and send `DONE ... <reason>` when they end (target, home,
+limit, time). Positions are permille of the physical stroke from the limit switch. There is
+no position sensor except the switch, so the firmware dead-reckons and re-zeroes at the
+switch; targets under 8% snap to it, so every return to the data area re-homes. `MOVE` is
+refused (`ERR notknown`) until the first HOME. The driver is muted whenever nothing is
+moving, because the parked spindle input creeps.
+
+### The textured drive: measured, and why the first model was wrong
+
+Playback uses a rough low-frequency PWM (440 Hz carrier, 4.9 Hz swell, random grit: variant
+P, picked by ear as the closest to a Mega CD) rather than the smooth 25 kHz drive the table
+above was measured with. The carrier's full-voltage pulses break stiction, so the sled moves
+at duties where the smooth drive stalls, and faster than the smooth table at the same mean
+duty. Measured with `DRIVE` and a smooth `HOME 0.5` as a ruler (`driveprobe.ps1`), out and in
+agreeing to a few percent:
+
+| mean duty | 0.02 | 0.04 | 0.06 | 0.08 | 0.10 | 0.12 | 0.14 | 0.16 | 0.18 | 0.20 | 0.24 | 0.30 | 0.40 | 0.50 |
+|-----------|------|------|------|------|------|------|------|------|------|------|------|------|------|------|
+| strokes/s | 0.01 | 0.07 | 0.14 | 0.24 | 0.34 | 0.46 | 0.56 | 0.68 | 0.78 | 0.88 | 1.04 | 1.36 | 1.84 | 2.30 |
+
+(A Mega CD full stroke of 2.4 s is 0.42 strokes/s, i.e. duty about 0.11.) This is
+`TEX_CURVE` in the firmware; it is only valid for the default carrier/swell/amp/grit.
+
+Why an earlier per-direction "efficiency" model was wrong: outward moves were running into
+the outer stop (the ruler reads 0.93 of a 510 ms stroke because a full stroke at duty 0.5 is
+really 472 ms), so the sled looked slower than it was and the return looked faster. Any
+measurement that can saturate at an end stop must be checked against the ruler's plateau.
+With the table, `MOVE 700 1971` covers 0.69-0.71 of the stroke in 1971 ms and the return
+takes 1.85-1.92 s against 1.92 asked.
+
+### Bench tools (`rp2040/`)
+
+* `servo_sim.py` runs the real firmware against a model sled with CircuitPython stubbed;
+  the model's true speeds are deliberately different from the firmware's belief.
+* `deploy.ps1` copies a file onto the board through the REPL (base64, 100 chars a line,
+  120 ms apart; 30 ms drops characters), CRC-checks it, resets and PINGs. boot.py leaves the
+  drive read-only to the PC, so this is the only way to change files.
+* `replay.ps1` plays the Sonic CD data->CDDA seek out and back, with the spindle glide.
+* `chars.ps1`, `driveprobe.ps1` measure true travel and speed against the ruler.
+* `hosttest/run.sh` runs the MiSTer-side translator against a fake board on a pty in real
+  time, using the real acoustic model.
+
+### MiSTer side (`physical_disc_rig.cpp`)
+
+`PHYSICAL_DISC_ACOUSTIC_RIG=1` (with `PHYSICAL_DISC_ACOUSTIC=1` or 2) in the core's ini
+section makes the existing worker loop play gestures through the rig instead of the spare
+disc. Gestures are played in real time: the translator sends the commands and waits out the
+time the original drive would have taken.
+
+| gesture | sent |
+|---------|------|
+| SLEW, STEP | `SPIN <dest rpm> <dur>` and `MOVE <permille of radius> <dur>` |
+| SPINUP, SPINDOWN | `SPIN <rpm> <dur>` / `SPIN 0 <dur>` |
+| SWEEP | `HOME`, then out to 950 and back in equal legs |
+| PARK | `SPIN 0` and `MOVE 0` |
+| STREAM | spindle follows the CLV rpm; a `MOVE` only once the creep reaches 4% of the stroke |
+| JUMP, HOLD, LOCK | nothing (LOCK waits its time) |
+
+If the board reports `ERR notknown` the translator homes and spends what is left of the time
+on the move. After three unanswered commands it drops the port and probes again each second.
+
+### Still open
+
+* Spindle duty to rpm is a guess (0.64 at 241 rpm, 0.76 at 431 rpm); the PS1 spindle
+  response has not been measured.
+* The ear verdict on the protocol-driven playback has not been taken yet, and the MiSTer
+  end-to-end test needs the Pico moved onto a MiSTer USB port.
+* The lens coils (ch1/ch2, IC722 pins 4-7) could add focus rattle; unused.

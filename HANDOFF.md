@@ -397,6 +397,17 @@ first to switch the running binary, then a plain-`MegaCD` MGL (the dangling glob
 MGL `<file path=…>` must be ABSOLUTE; a relative path fails silently. `pgrep` does
 not exist on this board.
 
+## 2026-10-09: the USB drive is replaced by a servo rig
+
+The USB drive hit a physical wall (SEEK is non-blocking, the sled is 2-3x too fast, every
+stop/start is an audible impulse), so the noise now comes from a PS1 optical block driven
+through its own BA5977FP by an RP2040. Everything is in `support/physical_disc/SERVO_RIG.md`
+under "The rig as built": wiring, the serial protocol, the measured textured-drive speed
+table, the bench tools, and how gestures map to commands. Code: `rp2040/servo_fw.py`
+(firmware), `physical_disc_rig.cpp` (MiSTer side, selected by `PHYSICAL_DISC_ACOUSTIC_RIG=1`).
+The MiSTer's `[MegaCD]` section already has the two keys; the binary is deployed. What is
+left is the end-to-end listen with the Pico on the MiSTer's USB.
+
 ## Open
 
 * **Needs ears, not measurement.** Whether 3–4 contiguous segments across the
