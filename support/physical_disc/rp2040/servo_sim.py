@@ -17,7 +17,8 @@ class World:
     pos = 0.6                 # TRUE sled position, fraction of stroke from the switch
     duty = {"fin": 0.0, "rin": 0.0}
     inv = False
-    true_eff = 0.45           # the firmware assumes 0.6: it is wrong, on purpose
+    true_eff_out = 0.80       # the firmware's table is right at 1.0: wrong, on purpose
+    true_eff_in = 1.25        # and different in each direction
     rx = b""
     tx = b""
     muted_driver = True
@@ -89,9 +90,15 @@ ns = {"__name__": "servo"}
 exec(compile(SRC, "servo_fw.py", "exec"), ns)
 
 # ------------------------------------------------------------------ harness
-def true_speed(d):
-    """The sled's real speed: the firmware's own curve, scaled by the TRUE efficiency."""
-    return ns["speed_at"](d) * (W.true_eff if ns["carrier"] != ns["CARRIER_PLAIN"] else 1.0)
+def true_speed(d, outward):
+    """The sled's real speed. Plain drive: the firmware's smooth curve. Textured drive: the firmware's
+    measured table at the MEAN duty (the texture is already in it), scaled by a true efficiency that
+    differs by direction and is wrong in the firmware's belief on purpose."""
+    if ns["carrier"] == ns["CARRIER_PLAIN"]:
+        return ns["speed_at"](d)
+    m = ns["mv"]
+    mean = (m.d + ns["TEX"]["bias"]) if m is not None else d
+    return ns["speed_tex"](mean) * (W.true_eff_out if outward else W.true_eff_in)
 
 def advance(seconds, dt=0.002):
     steps = int(seconds / dt)
@@ -102,7 +109,7 @@ def advance(seconds, dt=0.002):
             inv = ns["INV"]
             out_d = fin if not inv else rin
             in_d = rin if not inv else fin
-            v = (true_speed(out_d) if out_d > 0 else 0.0) - (true_speed(in_d) if in_d > 0 else 0.0)
+            v = (true_speed(out_d, True) if out_d > 0 else 0.0) - (true_speed(in_d, False) if in_d > 0 else 0.0)
             W.pos = min(1.0, max(0.0, W.pos + v * dt))
         ns["step"]()
         W.log_pos.append(W.pos)
@@ -180,8 +187,15 @@ W.pos = 0.0
 ns["known"] = True; ns["pos"] = 0.0
 send("TEX eff 0.05")                  # firmware now believes the sled is very slow
 send("MOVE 900 600", 0.05); advance(3.0)
-send("TEX eff 0.6")
+send("TEX eff 1.0")
 check("a mistaken speed assumption cannot drive past the stroke limit", W.pos <= 1.0)
+
+# The bench diagnostic: a fixed-duty drive for a fixed time, ended by the clock.
+send("HOME", 0.05); advance(6.0)
+r = send("DRIVE out 0.2 500", 0.05); advance(0.8)
+check("DRIVE out runs for the time asked and moves the sled", W.pos > 0.05 and not ns["mv"], "true %.3f" % W.pos)
+r = send("DRIVE in 0.5 3000", 0.05); advance(1.5)
+check("DRIVE in stops on the switch", W.pos == 0.0 and not ns["mv"])
 
 send("STOP")
 check("STOP mutes and parks", W.muted_driver and abs(W.spin - 0.515) < 0.01)

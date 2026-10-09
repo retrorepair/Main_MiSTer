@@ -8,6 +8,7 @@
 #   ST                      -> ST pos=<permille> known=<0|1> moving=<0|1> ...
 #   HOME [duty]             -> OK, then DONE HOME <ms> <reason>   (inward to the switch)
 #   MOVE <permille> <ms>    -> OK <from> <to>, then DONE MOVE <pos> <ms> <reason>
+#   DRIVE <out|in> <duty> <ms> -> OK, then DONE MOVE ...   (bench diagnostic, fixed duty)
 #   SPIN <rpm> <ms>         -> OK         (0 rpm parks the spindle)
 #   TEX <name> <value>      -> OK         (texture/tuning parameters, see TEX below)
 #   MUTE <0|1>              -> OK         (1 disables the driver chip)
@@ -49,12 +50,23 @@ LIMIT_CLOSED_LOW = True
 SPIN_STOP_DUTY = 0.515       # on the reference (Sony shows OUTVref at 1.7 V = 1.7 / 3.3)
 CARRIER_PLAIN = 25000        # inaudible: used wherever no texture is wanted
 
-# Full-stroke time against duty, measured on the bench (outer stop to inner switch),
-# repeatable to 1-5%. See SERVO_RIG.md. Below 0.16 the sled stalls on stiction.
+# Full-stroke time against duty for the SMOOTH drive (25 kHz PWM), measured on the bench from
+# the outer stop to the inner switch, repeatable to 1-5%. Below 0.16 the sled stalls on stiction.
+# Only the plain homing run uses this; see SERVO_RIG.md.
 CURVE = ((0.16, 5.04), (0.18, 3.30), (0.20, 2.40), (0.22, 1.84), (0.25, 1.375),
          (0.30, 0.949), (0.35, 0.777), (0.40, 0.675), (0.50, 0.510), (0.60, 0.416),
          (0.75, 0.332), (1.00, 0.253))
 SPEEDS = [(d, 1.0 / t) for d, t in CURVE]
+
+# The TEXTURED drive is a different animal. Its 440 Hz carrier gives the motor full-voltage pulses
+# that break the stiction, so it moves the sled at duties where the smooth drive stalls, and
+# faster than the smooth curve above at the same mean duty. Measured on the bench with DRIVE and
+# the HOME ruler (driveprobe.ps1), outward and inward agree to a few percent: mean duty
+# (before the swell and grit) against strokes of the PHYSICAL stroke per second, with the default
+# carrier/swell/amp/grit. Change those and this table no longer holds.
+TEX_CURVE = ((0.02, 0.01), (0.04, 0.065), (0.06, 0.138), (0.08, 0.243), (0.10, 0.338),
+             (0.12, 0.455), (0.14, 0.56), (0.16, 0.68), (0.18, 0.78), (0.20, 0.88),
+             (0.24, 1.04), (0.30, 1.36), (0.40, 1.84), (0.50, 2.30), (1.00, 4.0))
 
 # Tunables, changed with TEX. The defaults are the sound the owner picked by ear (P).
 TEX = {
@@ -63,7 +75,7 @@ TEX = {
     "amp": 0.03,        # swell depth, in duty
     "grit": 0.06,       # random duty noise
     "bias": 0.0,        # added to every textured duty
-    "eff": 0.6,         # how much slower the textured drive is than the smooth curve
+    "eff": 1.0,         # scales the textured speed the firmware believes (bench tuning)
     "min": 0.10,        # moves shorter than this fraction of the stroke are skipped
     "snap": 0.08,       # targets below this snap to the switch
     "spin_lo": 0.64,    # spindle duty at 241 rpm (rim)
@@ -99,16 +111,30 @@ def speed_at(d):
     return SPEEDS[-1][1]
 
 
+def speed_tex(d):
+    """Strokes per second of the TEXTURED drive at this mean duty, from TEX_CURVE."""
+    c = TEX_CURVE
+    if d <= c[0][0]:
+        return c[0][1] * (d / c[0][0]) if d > 0.0 else 0.0
+    for i in range(len(c) - 1):
+        d0, s0 = c[i]
+        d1, s1 = c[i + 1]
+        if d <= d1:
+            return s0 + (s1 - s0) * (d - d0) / (d1 - d0)
+    return c[-1][1]
+
+
 def duty_for(v):
-    """Inverse of speed_at: the duty that gives v strokes per second."""
-    lo, hi = 0.15, 1.0
-    for _ in range(22):
-        mid = (lo + hi) / 2.0
-        if speed_at(mid) < v:
-            lo = mid
-        else:
-            hi = mid
-    return hi
+    """The mean duty that gives the textured sled v strokes per second."""
+    c = TEX_CURVE
+    if v <= c[0][1]:
+        return c[0][0]
+    for i in range(len(c) - 1):
+        d0, s0 = c[i]
+        d1, s1 = c[i + 1]
+        if v <= s1:
+            return d0 + (d1 - d0) * (v - s0) / (s1 - s0)
+    return c[-1][0]
 
 
 # ------------------------------------------------------------------- hardware
@@ -295,6 +321,24 @@ def cmd_move(args):
     say("OK %d %d" % (int(pos * 1000), int(target * 1000)))
 
 
+def cmd_drive(args):
+    """DRIVE <out|in> <duty> <ms>: textured drive at a fixed duty for a fixed time.
+
+    A bench diagnostic, not used in playback: it is how the real speed of the textured
+    sled is measured against duty, with HOME as the ruler afterwards. It still stops at
+    the switch going in, and at the believed stroke limit going out."""
+    global mv
+    outward = args[0].lower().startswith("o")
+    d = float(args[1])
+    T = max(float(args[2]), 20.0) / 1000.0
+    if mv is not None:
+        coast()
+        mv = None
+    wake()
+    start_move("drive", outward, 1.0 if outward else 0.5, d, T, False, T)
+    say("OK")
+
+
 def rpm_duty(rpm):
     if rpm <= 0.0:
         return SPIN_STOP_DUTY
@@ -344,6 +388,8 @@ def handle(line):
             cmd_home(a)
         elif c == "MOVE":
             cmd_move(a)
+        elif c == "DRIVE":
+            cmd_drive(a)
         elif c == "SPIN":
             cmd_spin(a)
         elif c == "TEX":
@@ -404,14 +450,15 @@ def step():
         m.last = ns
         if m.plain:
             d = m.d
-            eff = 1.0
         else:
             env = 0.5 * (1.0 + math.sin(6.2831853 * TEX["swell"] * el))
             d = (m.d + TEX["bias"] - TEX["amp"] + 2.0 * TEX["amp"] * env
                  + TEX["grit"] * (random.random() * 2.0 - 1.0))
-            eff = TEX["eff"]
         drive(m.outward, d)
-        v = speed_at(d) * eff
+        if m.plain:
+            v = speed_at(d)
+        else:
+            v = speed_tex(m.d + TEX["bias"]) * TEX["eff"]
         pos += (v * dt) if m.outward else -(v * dt)
         if pos < 0.0:
             pos = 0.0
