@@ -65,7 +65,10 @@ static const acu_drive_t drives[PD_ACU_PROFILE_COUNT] = {
 	// firing at the wrong moment. What locking there is, is FOCUS, a lens
 	// operation (error 0x03 E-FOCUS retries if focus is down over 100 ms), so it
 	// moves no sled and makes no noise.
-	{ "MegaCD",    1.0, 1.0,  24,  480,   55,   160,  2400,  2200, 6000,  4, 1,   1 },
+	// calib_sweep 2: the Mega CD 2 service manual's TOC read-in flowchart (p.10) is power on, pickup
+	// to the inner edge until the P.U. switch closes, laser on, focus search, focus servo, spindle
+	// step, tracking servo, disc servo, read the TOC. It homes; it does not sweep the stroke.
+	{ "MegaCD",    1.0, 1.0,  24,  480,   55,   160,  2400,  2200, 6000,  4, 2,   1 },
 	// Saturn: 2x data / 1x audio. SOURCED -- an earlier note here claimed there
 	// was no citable seek model for this drive, which was wrong. Mednafen's CD
 	// block has one, in ss/cdb.cpp DRIVEPHASE_SEEK_START3:
@@ -330,35 +333,41 @@ void acu_model_event(acu_model_t *m, double now_ms, pd_acoustic_event_t ev, int 
 		// happen to think the spindle is doing. The sweep used to sit behind
 		// "if not already spinning", and a core reads its disc header before it
 		// announces the mount -- so that read span up the modelled spindle
-		// first and the boot sweep was skipped every single time. It is the
-		// longest travel the mechanism ever makes and the most recognisable
-		// thing about a console starting up, and it was never once played.
+		// first and the boot sweep was skipped every single time.
 		{
+			gesture_t g;
+			memset(&g, 0, sizeof(g));
+			g.kind      = GEST_SWEEP;
+			g.from_lba  = 0;
+			g.lba       = 0;
+			g.dur_ms    = d->full_stroke_ms * 1.5;
+			g.stages    = 2;
+			g.radial_mm = CD_R_OUTER_MM - CD_R_INNER_MM;
+			g.rpm       = cd_geom_rpm(0, d->data_speed);
+
+			if (d->calib_sweep == 2) {
+				// The PlayStation's CXD2545Q has an SSTP pin, "disc innermost track detect"
+				// (datasheet p.6), and the Mega CD 2 service manual's TOC read-in flowchart
+				// (p.10) agrees: the pickup goes to the inner edge until its switch closes,
+				// THEN the laser comes on, the lens searches for focus, the spindle is
+				// driven, tracking and disc servos close, and the TOC is read. There is no
+				// sweep of the whole stroke in that. So: home first, taking up to half a
+				// stroke, then spin up.
+				g.home_only = 1;
+				g.dur_ms    = d->full_stroke_ms * 0.5;
+				emit(m, &g);
+				m->head_lba = 0;
+			}
+
 			if (!m->spinning) {
 				m->spinning = 1;
 				m->holding  = 0;
 				simple(m, GEST_SPINUP, m->head_lba, d->spinup_ms, d->data_speed);
 			}
-			// These decks drag the sled across the disc once to calibrate the
-			// focus and tracking servos before they can read the TOC.
-			if (d->calib_sweep) {
-				gesture_t g;
-				memset(&g, 0, sizeof(g));
-				g.kind      = GEST_SWEEP;
-				g.from_lba  = 0;
-				g.lba       = 0;
-				g.dur_ms    = d->full_stroke_ms * 1.5;
-				g.stages    = 2;
-				g.radial_mm = CD_R_OUTER_MM - CD_R_INNER_MM;
-				g.rpm       = cd_geom_rpm(0, d->data_speed);
-				if (d->calib_sweep == 2) {
-					// The PlayStation's CXD2545Q has an SSTP pin, "disc innermost track
-					// detect" (datasheet p.6), and its start-up is: sled to the hub, focus
-					// search, gain adjust, spindle kick, TOC. There is no sweep of the whole
-					// stroke in that, so it just homes, taking up to one stroke.
-					g.home_only = 1;
-					g.dur_ms    = d->full_stroke_ms;
-				}
+
+			// The other decks in this table are assumed to drag the sled across the disc
+			// once to calibrate the focus and tracking servos before they can read the TOC.
+			if (d->calib_sweep == 1) {
 				emit(m, &g);
 				m->head_lba = 0;
 			}

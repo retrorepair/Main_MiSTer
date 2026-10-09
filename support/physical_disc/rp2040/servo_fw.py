@@ -75,6 +75,7 @@ TEX = {
     "amp": 0.03,        # swell depth, in duty
     "grit": 0.12,       # random duty noise
     "bias": 0.0,        # added to every textured duty
+    "kick_min": 0.30,   # the textured drive's mean duty is tiny, so its kick and brake use at least this
     "kick_ms": 12.0,    # smooth moves start with a kick: the datasheet's sled kick (CXD2545Q p.30) is
     "kick_gain": 2.0,   # basic level x1..x4 for 2.9..23.2 ms. The levels here are a first guess
     "brake_ms": 10.0,   # until a real PS1 is captured; the brake is the reverse pulse that ends a jump
@@ -292,10 +293,11 @@ def finish(reason):
     global mv, known, pos
     m = mv
     mv = None
-    if reason == "target" and m.plain and m.kind == "move":
-        # The jump ends with a reverse kick (CXD2545Q p.57-61: brake B / kick D) before the
-        # servo takes over, which is the click at the end of a PlayStation seek.
-        drive(not m.outward, m.d)
+    if reason == "target" and m.kind == "move":
+        # The jump ends with a reverse kick (CXD2545Q p.57-61: brake B / kick D; the Mega CD 2
+        # feed waveform on service manual p.14 shows reverse pulses too) before the servo takes
+        # over: the click at the end of a seek.
+        drive(not m.outward, m.d if m.plain else max(m.d, TEX["kick_min"]))
         time.sleep(TEX["brake_ms"] / 1000.0)
     coast()
     ms = int((time.monotonic_ns() - m.t0) / 1000000)
@@ -495,6 +497,9 @@ def step():
             env = 0.5 * (1.0 + math.sin(6.2831853 * TEX["swell"] * el))
             d = (m.d + TEX["bias"] - TEX["amp"] + 2.0 * TEX["amp"] * env
                  + TEX["grit"] * (random.random() * 2.0 - 1.0))
+            if m.kind == "move" and el * 1000.0 < TEX["kick_ms"]:
+                # The Mega CD 2 feed drive starts with a kick spike (service manual p.14)
+                d = max(d * TEX["kick_gain"], TEX["kick_min"])
         drive(m.outward, d)
         if m.plain:
             v = speed_at(m.d) * m.k
