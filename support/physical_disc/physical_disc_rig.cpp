@@ -42,7 +42,10 @@ static struct {
 
 	int    want_smooth;       // drive style the current profile wants
 	int    sent_smooth;       // the style the board was last told (-1 = not yet)
-} rig = { -1, {0}, 0, {0}, 0, 0, 0, 0, 0, 0, -1 };
+
+	const struct lens_policy *pol;   // what this console's lens coils do (set by rig_set_profile)
+	int    noise;             // continuous coil noise level the board is running (0 = none)
+} rig = { -1, {0}, 0, {0}, 0, 0, 0, 0, 0, 0, -1, NULL, 0 };
 
 static void (*g_log)(const char *line);
 
@@ -74,6 +77,44 @@ static void nap_ms(double ms)
 	ts.tv_nsec = (long)((ms - ts.tv_sec * 1000.0) * 1e6);
 	nanosleep(&ts, NULL);
 }
+
+// ------------------------------------------------------- lens policy -----
+//
+// The board can drive the pickup's two lens coils (focus and tracking) as well as the sled and spindle,
+// and the real consoles' pickups make noise with them: the PlayStation's one-kilohertz auto-gain tone,
+// focus-search ramps, tracking pulling in after a seek, the broadband hiss of the servos working.
+//
+// WHAT IS SOURCED AND WHAT IS NOT. The existence and order of the boot steps come from the documents:
+// the Mega CD 2 service manual p.10 (sled home, laser on, focus search, focus on, spindle, tracking,
+// disc servo, TOC), the CXD2545Q datasheet (spindle KICK, AGCNTL's 1 kHz sine, tracking servo off during a
+// sled move) and a recording of a real PlayStation starting up (the 1 kHz tone at about 3.2 s, lasting
+// 0.4 s; steady broadband noise while reading). The LEVELS, LENGTHS and WHICH CONSOLE DOES WHICH are
+// best guesses: nothing here was measured on any console but that one PlayStation recording, and the
+// only other console recording (a Mega CD) has no lens-level detail. They are the numbers to tune when
+// the rig is recorded and compared with the real thing.
+//
+// Levels are the firmware's LENS Z levels: 1 = about 0.3 V RMS across the coil, 2 = 0.9 V, 3 = 2.5 V
+// (burst only, 1.5 s at most); the BA5977FP channels give 5 V x duty at most (datasheet).
+struct lens_policy {
+	int focus_ms;      // boot: focus-search ramp after the sled homes (0 = none)
+	int beep;          // boot: the CXD2545Q auto-gain tone after focus is found
+	int read_noise;    // continuous noise level while the disc is spinning and tracking
+	int seek_noise;    // noise level while the sled travels (0 = lens quiet: tracking servo is open)
+	int relock_ms;     // burst when tracking pulls back in at the end of a seek or a lock
+	int kick_ms;       // spindle spin-up: full-drive KICK before the speed servo takes over
+};
+
+static const struct lens_policy policies[PD_ACU_PROFILE_COUNT] = {
+	// focus beep read seek relock kick     (profile order is the pd_acoustic_profile_t order)
+	{  1000,  0,   0,   2,   100,   0   },   // auto: the generic row, no console claimed
+	{   300,  1,   1,   0,   150,   500 },   // PlayStation: the one with a recording behind it
+	{  2000,  0,   0,   2,   100,   0   },   // Mega CD: focus search about 2 s (service manual flowchart)
+	{  3000,  0,   0,   2,   100,   0   },   // Saturn: "approx. 3 seconds" of lens up and down (manual p.8)
+	{  2000,  0,   0,   2,   100,   0   },   // PC Engine CD: same Sony family as the Mega CD 2
+	{  1000,  0,   0,   2,   100,   0   },   // 3DO: nothing documented, generic
+	{  1000,  0,   0,   2,   100,   0   },   // CD-i: nothing documented, generic
+	{  2000,  0,   0,   2,   100,   0   },   // Neo Geo CD: same Sony family as the Mega CD 2
+};
 
 // ------------------------------------------------------------ serial -----
 
@@ -225,6 +266,7 @@ int rig_connect(void)
 
 			// Whatever it was doing when we found it, start from a known quiet state.
 			cmd("STOP", REPLY_MS);
+			rig.noise = 0;
 			rig.spin_rpm = 0.0;
 			rig.pos_pm   = 0;
 			rig.sent_smooth = -1;
@@ -243,6 +285,7 @@ void rig_disconnect(int park)
 {
 	if (rig.fd < 0) return;
 	if (park) cmd("STOP", REPLY_MS);
+	rig.noise = 0;
 	if (rig.fd >= 0) close(rig.fd);
 	rig.fd = -1;
 	rig.rxn = 0;
@@ -272,6 +315,47 @@ static int wait_until(double end, int (*aborted)(void))
 	return 0;
 }
 
+// Continuous broadband noise on both lens coils at `level`, or none at 0. Costs a command only on a change.
+static void lens_noise(int level)
+{
+	if (level == rig.noise) return;
+	char line[32];
+	if (level > 0) snprintf(line, sizeof(line), "LENS B Z %d 0", level);
+	else           snprintf(line, sizeof(line), "LENS OFF");
+	if (cmd(line, REPLY_MS)) rig.noise = level;
+}
+
+// A burst of noise on both coils for `ms`. The board ends it by itself and is silent afterwards, so
+// whatever continuous noise was running is gone and the caller puts it back when the burst is over.
+static void lens_burst(int level, double ms)
+{
+	if (level <= 0 || ms < 20.0) return;
+	char line[32];
+	snprintf(line, sizeof(line), "LENS B Z %d %d", level, (int)ms);
+	cmd(line, REPLY_MS);
+	rig.noise = 0;
+}
+
+// The lens part of a boot, after the sled has found the hub: the focus-search ramp and, on a
+// PlayStation, the auto-gain tone. Returns 1 if aborted.
+static int lens_boot(int (*aborted)(void))
+{
+	const struct lens_policy *p = rig.pol;
+	char line[48];
+	rig.noise = 0;
+	if (p->focus_ms > 0) {
+		snprintf(line, sizeof(line), "LENS F S 1 %d", p->focus_ms);
+		cmd(line, REPLY_MS);
+		if (wait_until(now_ms() + p->focus_ms, aborted)) return 1;
+	}
+	if (p->beep) {
+		// CXD2545Q AGCNTL: a 1 kHz sine into the loop. The recording has it at 1004 Hz for 0.4 s.
+		cmd("LENS F G 0.19 400 1000", REPLY_MS);
+		if (wait_until(now_ms() + 400.0, aborted)) return 1;
+	}
+	return 0;
+}
+
 // Drive the sled to the inner switch and wait for the board to say it got there.
 // 0 = homed, 1 = aborted, -1 = no answer.
 static int do_home(int (*aborted)(void))
@@ -288,14 +372,21 @@ static int do_home(int (*aborted)(void))
 }
 
 // Ask for the spindle to ramp to `rpm` over `ramp_ms`. Skipped when it is already there.
-static void do_spin(double rpm, double ramp_ms, int force)
+// From a standstill with kick_ms > 0 the first part of the time is the CXD2545Q's KICK (full forward
+// drive until the speed is near) and the rest the ramp to the target.
+static void do_spin(double rpm, double ramp_ms, int force, int kick_ms)
 {
 	if (!force && rpm > 0.0 && fabs(rpm - rig.spin_rpm) < SPIN_RETUNE * rpm) return;
 	if (!force && rpm <= 0.0 && rig.spin_rpm <= 0.0) return;
 
-	char line[48];
+	char line[64];
 	if (ramp_ms < MIN_RAMP_MS) ramp_ms = MIN_RAMP_MS;
-	snprintf(line, sizeof(line), "SPIN %d %d", (int)(rpm + 0.5), (int)ramp_ms);
+	if (kick_ms > 0 && rpm > 0.0 && rig.spin_rpm <= 0.0) {
+		if (kick_ms > ramp_ms * 0.6) kick_ms = (int)(ramp_ms * 0.6);
+		snprintf(line, sizeof(line), "SPIN %d %d %d", (int)(rpm + 0.5), (int)(ramp_ms - kick_ms), kick_ms);
+	}
+	else
+		snprintf(line, sizeof(line), "SPIN %d %d", (int)(rpm + 0.5), (int)ramp_ms);
 	if (cmd(line, REPLY_MS)) rig.spin_rpm = rpm;
 }
 
@@ -325,6 +416,8 @@ void rig_set_profile(int profile)
 	// The PlayStation's sled is driven by a plain, high-frequency PWM at a fixed level (CXD2545Q p.78)
 	// and sounds like a clean whirr. The Mega CD's rough drag is the Mega CD's own.
 	rig.want_smooth = (profile == PD_ACU_PROFILE_PSX) ? 1 : 0;
+	if (profile < 0 || profile >= PD_ACU_PROFILE_COUNT) profile = PD_ACU_PROFILE_AUTO;
+	rig.pol = &policies[profile];
 }
 
 // Make the board's drive style match the profile; costs one command, and only when it has changed.
@@ -339,6 +432,8 @@ static void sync_style(void)
 void rig_play(const gesture_t *g, int (*aborted)(void))
 {
 	if (rig.fd < 0) return;
+	if (!rig.pol) rig.pol = &policies[PD_ACU_PROFILE_AUTO];
+	const struct lens_policy *pol = rig.pol;
 	sync_style();
 
 	double t0  = now_ms();
@@ -354,13 +449,15 @@ void rig_play(const gesture_t *g, int (*aborted)(void))
 		break;
 
 	case GEST_HOLD:
-		// Spindle turning, head parked. Nothing to do.
+		// Spindle turning, head parked, servos still tracking.
+		lens_noise(pol->read_noise);
 		break;
 
 	case GEST_STREAM: {
 		// Reading: the spindle follows the CLV glide, and the sled creeps outward. Both are
 		// small. The creep is only worth a command once it has added up to something.
-		do_spin(g->rpm, 250.0, 0);
+		lens_noise(pol->read_noise);
+		do_spin(g->rpm, 250.0, 0, 0);
 		int pm = stroke_pm(g->lba);
 		if (abs(pm - rig.pos_pm) >= 40 && pm > 0)
 			do_move(pm, 700.0, t0, aborted, 0);   // never worth a homing run
@@ -371,30 +468,49 @@ void rig_play(const gesture_t *g, int (*aborted)(void))
 	case GEST_SLEW: {
 		// The spindle glides to the speed of the destination while the sled travels, which is the
 		// pitch swoop a CLV drive makes crossing the disc.
-		do_spin(g->rpm, dur, 1);
+		do_spin(g->rpm, dur, 1, 0);
+		// The tracking servo is open while the sled travels, so on a PlayStation the lens is quiet; the
+		// others hiss. Tracking pulling back in at the end is a burst.
+		double relock = pol->relock_ms;
+		if (relock > dur * 0.3) relock = dur * 0.3;
+		if (pol->seek_noise) lens_burst(pol->seek_noise, dur - relock);
+		else                 lens_noise(0);
 		if (do_move(stroke_pm(g->lba), dur, t0, aborted, 1)) break;
+		if (wait_until(end - relock, aborted)) break;
+		lens_burst(3, relock);
+		if (wait_until(end, aborted)) break;
+		lens_noise(pol->read_noise);
+		break;
+	}
+
+	case GEST_LOCK: {
+		// Focus and spin-lock: a lens operation, no sled. Tracking pulls in with a burst, then the
+		// servo settles into its steady noise.
+		double relock = pol->relock_ms;
+		if (relock > dur) relock = dur;
+		lens_burst(3, relock);
+		if (wait_until(t0 + relock, aborted)) break;
+		lens_noise(pol->read_noise);
 		wait_until(end, aborted);
 		break;
 	}
 
-	case GEST_LOCK:
-		// Focus and spin-lock: a lens operation, no sled. Keep the time, make no noise.
-		wait_until(end, aborted);
-		break;
-
 	case GEST_SPINUP:
-		do_spin(g->rpm, dur, 1);
+		do_spin(g->rpm, dur, 1, pol->kick_ms);
 		wait_until(end, aborted);
 		break;
 
 	case GEST_SPINDOWN:
-		do_spin(0.0, dur, 1);
+		lens_noise(0);
+		do_spin(0.0, dur, 1, 0);
 		wait_until(end, aborted);
 		break;
 
 	case GEST_SWEEP: {
 		// The deck calibrates: in to the hub, out to the rim, back. Two equal legs after the homing.
+		lens_noise(0);
 		if (do_home(aborted) != 0) break;
+		if (lens_boot(aborted)) break;
 		if (g->home_only) {   // a PlayStation only finds its innermost track
 			wait_until(end, aborted);
 			break;
@@ -410,7 +526,8 @@ void rig_play(const gesture_t *g, int (*aborted)(void))
 	}
 
 	case GEST_PARK:
-		do_spin(0.0, dur, 1);
+		lens_noise(0);
+		do_spin(0.0, dur, 1, 0);
 		if (!do_move(0, dur, t0, aborted, 1)) wait_until(end, aborted);
 		break;
 

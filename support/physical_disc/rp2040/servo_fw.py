@@ -10,6 +10,10 @@
 #   MOVE <permille> <ms>    -> OK <from> <to>, then DONE MOVE <pos> <ms> <reason>
 #                              (reason: target, home, limit, time, or stuck = never left the hub)
 #   DRIVE <out|in> <duty> <ms> -> OK, then DONE MOVE ...   (bench diagnostic, fixed duty)
+#   LENS <F|T|B> Z <level 1-3> <ms>   broadband noise on the coils from a random pulse stream played
+#                           by PIO and DMA (ms 0 = until LENS OFF; level 3 is limited to a short burst)
+#   LENS <F|T|B> G <amp> <ms> <hz>    a bipolar tone, e.g. the PS1's 1 kHz auto-gain beep
+#   SPIN <rpm> <ms> [kick_ms]         optional kick: the spindle held at spin_kick for kick_ms first
 #   LENS <F|T|B> <N|D|R|S> <amp> <ms> [carrier] -> OK, then DONE LENS <ms>
 #                           drives the pickup's lens coils through IC722 ch1 (F, focus) and ch2
 #                           (T, tracking): N noise, D steady level, R ramp -amp..amp, S saw 0..amp. amp is 0..1 of the
@@ -43,6 +47,9 @@ import time
 import math
 import random
 import usb_cdc
+import array
+import gc
+import rp2pio
 
 PIN_FIN, PIN_RIN = board.GP4, board.GP5
 PIN_LIMIT = board.GP6
@@ -92,6 +99,8 @@ TEX = {
     "lens_tau": 1.0,    # (4 V: what a full 0-7 V search ramp averages) over this many seconds: short
                         # strong pulses pass, a long steady push is scaled back
     "lens_carrier": 8000.0,  # PWM carrier of the noise drive: audible, so it is part of the sound
+    "spin_kick": 0.62,  # spindle duty during a SPIN kick (the CXD2545Q KICK is full drive; this rig
+                        # got loud above 0.62)
     "kick_min": 0.30,   # the textured drive's mean duty is tiny, so its kick and brake use at least this
     "kick_ms": 12.0,    # smooth moves start with a kick: the datasheet's sled kick (CXD2545Q p.30) is
     "kick_gain": 2.0,   # basic level x1..x4 for 2.9..23.2 ms. The levels here are a first guess
@@ -207,6 +216,26 @@ for _k in PIN_LENS:
                 pwmio.PWMOut(PIN_LENS[_k][1], frequency=CARRIER_PLAIN, duty_cycle=0)]
     lens_car[_k] = CARRIER_PLAIN
 
+lens_pio = {}                            # channel -> StateMachine while PIO owns that pair of pins
+lens_buf = None                          # the looped noise buffer DMA is reading
+NOISE_PROG = array.array("H", [0x6002])  # OUT pins, 2: two bits per symbol, to FIN and RIN
+NOISE_HZ = 64000                         # symbols per second: 15.6 us pulses, white to 32 kHz
+# Pulse probability per bit, by level. The BA5977FP channel gives 5 V x duty (datasheet), so the RMS
+# across the coil is 5 V x sqrt(2p) for small p: about 0.3 V, 0.9 V and 2.5 V.
+NOISE_P = {1: 1.0 / 512.0, 2: 1.0 / 64.0, 3: 1.0 / 8.0}
+
+
+def make_noise(level):
+    """A 65536-bit stream with the level's density of set bits, placed at random."""
+    buf = array.array("L", [0] * 2048)
+    for _ in range(int(NOISE_P[level] * 65536)):
+        i = random.getrandbits(16)
+        buf[i >> 5] |= 1 << (i & 31)
+    return buf
+
+
+noise_bufs = {lv: make_noise(lv) for lv in NOISE_P}
+
 
 def load_dir():
     try:
@@ -242,8 +271,43 @@ def drive(outward, d):
         rin.duty_cycle = u16(d)
 
 
+def lens_release(k):
+    """Let go of a lens pair's pins so a PIO state machine can have them."""
+    p = lens[k]
+    if p is not None:
+        p[0].deinit()
+        p[1].deinit()
+    lens[k] = None
+    lens_car[k] = 0
+
+
+def lens_restore(k):
+    if lens[k] is None:
+        lens[k] = [pwmio.PWMOut(PIN_LENS[k][0], frequency=CARRIER_PLAIN, duty_cycle=0),
+                   pwmio.PWMOut(PIN_LENS[k][1], frequency=CARRIER_PLAIN, duty_cycle=0)]
+        lens_car[k] = CARRIER_PLAIN
+
+
+def lens_pio_stop():
+    global lens_buf
+    for k in list(lens_pio):
+        try:
+            lens_pio[k].deinit()
+        except Exception:
+            pass
+        del lens_pio[k]
+    lens_buf = None
+
+
+def tone_prog(d):
+    """FIN pulse, idle, RIN pulse, idle: a bipolar square wave whose pulse width d/32 sets the level."""
+    return array.array("H", [0xE001 | (d << 8), 0xE000 | ((31 - d) << 8),
+                             0xE002 | (d << 8), 0xE000 | ((31 - d) << 8)])
+
+
 def lens_carrier(k, f):
     f = int(f)
+    lens_restore(k)
     if lens_car[k] == f:
         return
     lens[k][0].deinit()
@@ -272,7 +336,10 @@ def lens_off():
     global lens_job, lens_t_end
     lens_job = None
     lens_t_end = time.monotonic_ns()
+    if lens_pio:
+        lens_pio_stop()
     for k in lens:
+        lens_restore(k)
         lens[k][0].duty_cycle = 0
         lens[k][1].duty_cycle = 0
 
@@ -426,7 +493,7 @@ def cmd_move(args):
 
 def cmd_lens(args):
     """LENS <F|T|B> <N|D|R> <amp> <ms> [carrier], or LENS OFF."""
-    global lens_job
+    global lens_job, lens_buf
     if args[0].upper() == "OFF":
         lens_off()
         say("OK")
@@ -434,14 +501,47 @@ def cmd_lens(args):
     chs = ("F", "T") if args[0].upper() == "B" else (args[0].upper(),)
     mode = args[1].upper()
     amp = float(args[2])
-    T = max(float(args[3]), 20.0) / 1000.0
-    if mode not in ("N", "D", "R", "S"):
+    ms = float(args[3])
+    T = max(ms, 20.0) / 1000.0
+    if mode not in ("N", "D", "R", "S", "Z", "G"):
         say("ERR mode")
         return
     for k in chs:
         if k not in lens:
             say("ERR channel")
             return
+    if lens_pio:
+        lens_off()                        # PIO still has the pins: give them back before PWM wants them
+    if mode in ("Z", "G"):
+        wake()
+        if mode == "Z":
+            level = 1 if amp < 1.5 else (2 if amp < 2.5 else 3)
+            if level == 3:
+                T = (1500.0 if ms <= 0.0 else min(max(ms, 20.0), 1500.0)) / 1000.0   # bursts only
+            elif ms <= 0.0:
+                T = 1.0e9                                       # until LENS OFF
+            lens_buf = noise_bufs[level]
+        else:
+            hz = float(args[4]) if len(args) > 4 else 1000.0
+            d = int(min(max(amp, 0.0), 0.4) * 31.0 + 0.5)       # tone level capped at 40% of the 5 V swing
+        for k in chs:
+            lens_release(k)
+            if mode == "Z":
+                sm = rp2pio.StateMachine(NOISE_PROG, frequency=NOISE_HZ, first_out_pin=PIN_LENS[k][0],
+                                         out_pin_count=2, auto_pull=True, pull_threshold=32,
+                                         out_shift_right=True)
+                sm.background_write(loop=lens_buf)
+            else:
+                sm = rp2pio.StateMachine(tone_prog(d), frequency=int(hz * 66), first_set_pin=PIN_LENS[k][0],
+                                         set_pin_count=2)
+            lens_pio[k] = sm
+        j = Mv()
+        j.chs, j.mode, j.amp, j.T = chs, mode, amp, T
+        j.t0 = time.monotonic_ns()
+        j.last = j.t0
+        lens_job = j
+        say("OK")
+        return
     car = float(args[4]) if len(args) > 4 else (TEX["lens_carrier"] if mode == "N" else CARRIER_PLAIN)
     wake()
     for k in chs:
@@ -486,13 +586,22 @@ def rpm_duty(rpm):
 
 
 def cmd_spin(args):
-    global spin_ramp, spin_rpm
+    global spin_ramp, spin_rpm, spin_duty
     rpm = float(args[0])
     T = max(float(args[1]), 1.0) / 1000.0 if len(args) > 1 else 0.05
     if rpm > 0.0:
         wake()
     spin_rpm = rpm
-    spin_ramp = (time.monotonic_ns(), T, spin_duty, rpm_duty(rpm))
+    now = time.monotonic_ns()
+    kick = float(args[2]) / 1000.0 if len(args) > 2 else 0.0
+    if rpm > 0.0 and kick > 0.0:
+        # The CXD2545Q spins a disc up with KICK (full forward drive) until the speed is near, then
+        # hands over to the CLV servo: hold the kick duty, then ramp to the target.
+        spin_ramp = (now + int(kick * 1e9), T, TEX["spin_kick"], rpm_duty(rpm))
+        spin_duty = TEX["spin_kick"]
+        spin.duty_cycle = u16(spin_duty)
+    else:
+        spin_ramp = (now, T, spin_duty, rpm_duty(rpm))
     say("OK")
 
 
@@ -636,6 +745,8 @@ def step():
         if el >= lj.T:
             lens_off()
             say("DONE LENS %d" % int(lj.T * 1000))
+        elif lj.mode in ("Z", "G"):
+            pass                                          # PIO and DMA are doing the work
         else:
             ldt = (ns - lj.last) * 1e-9
             lj.last = ns
@@ -664,6 +775,8 @@ def step():
     r = spin_ramp
     if r is not None:
         f = (ns - r[0]) * 1e-9 / r[1]
+        if f < 0.0:
+            f = 0.0                                       # still in the kick: hold the kick duty
         if f >= 1.0:
             f = 1.0
             spin_ramp = None

@@ -51,6 +51,10 @@ while True:
         if c == "PING": out("OK servo 1")
         elif c == "STOP": known = known; out("OK")
         elif c == "SPIN" or c == "TEX": out("OK")
+        elif c == "LENS":
+            out("OK")
+            if len(p) > 4 and int(p[4]) > 0:
+                later(int(p[4]) / 1000.0, "DONE LENS %s" % p[4])
         elif c == "HOME":
             out("OK"); known = True; pos = 0
             later(0.6, "DONE HOME 0 600 home")

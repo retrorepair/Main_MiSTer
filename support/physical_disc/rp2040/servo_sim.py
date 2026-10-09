@@ -86,7 +86,15 @@ usb_cdc = types.ModuleType("usb_cdc"); usb_cdc.data = Serial()
 digitalio = types.ModuleType("digitalio"); digitalio.DigitalInOut = DIO
 digitalio.Direction = DIO.Direction; digitalio.Pull = DIO.Pull
 pwmio = types.ModuleType("pwmio"); pwmio.PWMOut = PWM
-sys.modules.update(board=board, digitalio=digitalio, pwmio=pwmio, usb_cdc=usb_cdc)
+class SM:
+    made = 0
+    def __init__(self, program, frequency, **kw):
+        self.program, self.frequency, self.kw, self.alive, self.loop = program, frequency, kw, True, None
+        SM.made += 1
+    def background_write(self, loop=None): self.loop = loop
+    def deinit(self): self.alive = False
+rp2pio = types.ModuleType("rp2pio"); rp2pio.StateMachine = SM
+sys.modules.update(board=board, digitalio=digitalio, pwmio=pwmio, usb_cdc=usb_cdc, rp2pio=rp2pio)
 
 import time as _time
 _time.monotonic_ns = lambda: W.t_ns
@@ -245,6 +253,34 @@ check("a short full push reaches the peak cap", short_peak > 0.55, "%.3f" % shor
 now = max(W.lens_now.values())
 check("a 4 s steady push is held to the RMS limit by the end", now <= ns["TEX"]["lens_rms"] + 0.03, "drive at the end %.3f, rms limit %.2f" % (now, ns["TEX"]["lens_rms"]))
 send("LENS OFF"); W.tx = b""
+
+# PIO lens modes: noise from a looped buffer, a tone, and the pins going back to PWM afterwards.
+send("LENS B Z 2 300", 0.05)
+check("LENS Z starts PIO noise on both pairs", SM.made >= 2 and len(ns["lens_pio"]) == 2 and ns["lens_buf"] is not None)
+check("with a buffer whose density matches level 2", abs(sum(bin(w).count("1") for w in ns["lens_buf"]) / 65536.0 - 1.0 / 64.0) < 0.003)
+advance(0.5)
+out = W.tx.decode(); W.tx = b""
+check("and ends with DONE LENS, pins back on PWM", "DONE LENS" in out and not ns["lens_pio"] and ns["lens"]["F"] is not None, out.strip().replace("\n", " | "))
+send("LENS F G 0.2 200 1000", 0.05)
+check("LENS G plays a tone with a 4-instruction program", len(ns["lens_pio"]) == 1 and len(ns["lens_pio"]["F"].program) == 4)
+advance(0.4)
+out = W.tx.decode(); W.tx = b""
+check("and finishes", "DONE LENS" in out and not ns["lens_pio"], out.strip().replace("\n", " | "))
+send("LENS B Z 3 0", 0.05)
+check("level 3 noise is limited to a burst", ns["lens_job"] is not None and ns["lens_job"].T <= 1.5, "T=%.2f" % ns["lens_job"].T)
+send("LENS OFF"); W.tx = b""
+send("LENS B Z 1 0", 0.05)
+check("level 1 can run until LENS OFF", ns["lens_job"].T > 1.0e6)
+send("LENS F N 0.5 100", 0.05)
+check("a PWM lens command takes the pins back from PIO", not ns["lens_pio"])
+advance(0.2); send("LENS OFF"); W.tx = b""
+# Spindle kick: the kick duty first, then a ramp down to the target.
+send("SPIN 400 500 300", 0.02)
+advance(0.2)
+d_kick = W.spin
+advance(1.0)
+check("SPIN with a kick holds the kick duty first, then settles lower", abs(d_kick - ns["TEX"]["spin_kick"]) < 0.01 and W.spin < d_kick - 0.005, "kick %.3f then %.3f" % (d_kick, W.spin))
+send("SPIN 0 100"); advance(0.3)
 
 send("STOP")
 check("STOP mutes and parks", W.muted_driver and abs(W.spin - 0.515) < 0.01)

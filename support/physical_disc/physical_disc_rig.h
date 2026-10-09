@@ -27,7 +27,9 @@ void rig_play(const gesture_t *g, int (*aborted)(void));
 
 // Tell the rig which console's drive is being imitated (a pd_acoustic_profile_t). The PlayStation's
 // sled is driven smoothly, with a kick and a brake, where the Mega CD's is a rough drag, so the board's
-// drive style follows the profile.
+// drive style follows the profile. The profile also picks what the lens coils do (focus-search ramp,
+// the PlayStation's 1 kHz auto-gain tone, steady servo noise or seek bursts); see lens_policy in
+// physical_disc_rig.cpp for what is sourced and what is a best guess.
 void rig_set_profile(int profile);
 
 // Optional trace sink; the player points this at its own log.
