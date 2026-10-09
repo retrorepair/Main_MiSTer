@@ -10,10 +10,10 @@
 #   MOVE <permille> <ms>    -> OK <from> <to>, then DONE MOVE <pos> <ms> <reason>
 #                              (reason: target, home, limit, time, or stuck = never left the hub)
 #   DRIVE <out|in> <duty> <ms> -> OK, then DONE MOVE ...   (bench diagnostic, fixed duty)
-#   LENS <F|T|B> Z <level 1-3> <ms>   broadband noise on the coils from a random pulse stream played
+#   LENS <F|T|B> Z <level 1-3> <ms> [hz]  broadband noise on the coils from a random pulse stream played
 #                           by PIO and DMA (ms 0 = until LENS OFF; level 3 is limited to a short burst)
-#   LENS <F|T|B> G <peak> <ms> <hz>   a triangle tone (peak = duty of the 5 V swing, up to 0.6), e.g.
-#                           the PS1's 1 kHz auto-gain beep
+#   LENS <F|T|B> G <peak> <ms> <hz> [t|s]  a triangle (default) or sine tone (peak = duty of the 5 V swing,
+#                           up to 0.6), e.g. the PS1's 1 kHz auto-gain beep
 #   SPIN <rpm> <ms> [kick_ms]         optional kick: the spindle held at spin_kick for kick_ms first
 #   LENS <F|T|B> <N|D|R|S> <amp> <ms> [carrier] -> OK, then DONE LENS <ms>
 #                           drives the pickup's lens coils through IC722 ch1 (F, focus) and ch2
@@ -306,7 +306,7 @@ TONE_CARRIER = 25000                     # the tone is PWM at about this rate, i
 TONE_MAX = 0.6                           # peak duty: 60% of the 5 V swing
 
 
-def make_tone(peak, hz):
+def make_tone(peak, hz, shape="t"):
     """A triangle wave at hz built from 25 kHz PWM, as a looped buffer for the same PIO program as the noise.
 
     Each carrier period is 32 symbols = 64 bits = two words; the leading symbols carry the pulse (1 = FIN,
@@ -319,7 +319,10 @@ def make_tone(peak, hz):
     for k in range(n):
         ph = (k + 0.5) / n + 0.25
         ph -= int(ph)
-        v = a * (1.0 - 4.0 * abs(ph - 0.5))              # -a .. +a, rising through zero at ph = 0.25
+        if shape == "s":
+            v = a * math.sin(6.283185307 * (ph - 0.25))  # a sine from the same zero crossing
+        else:
+            v = a * (1.0 - 4.0 * abs(ph - 0.5))          # -a .. +a, rising through zero at ph = 0.25
         w = int(abs(v) * 32.0 + 0.5)
         val = (((1 << (2 * w)) - 1) // 3) * (1 if v > 0.0 else 2)
         buf[2 * k] = val & 0xFFFFFFFF
@@ -543,9 +546,10 @@ def cmd_lens(args):
             elif ms <= 0.0:
                 T = 1.0e9                                       # until LENS OFF
             lens_buf = noise_bufs[level]
-            rate = NOISE_HZ
+            rate = int(float(args[4])) if len(args) > 4 else NOISE_HZ
         else:
-            lens_buf, rate = make_tone(amp, float(args[4]) if len(args) > 4 else 1000.0)
+            lens_buf, rate = make_tone(amp, float(args[4]) if len(args) > 4 else 1000.0,
+                                       args[5].lower() if len(args) > 5 else "t")
         for k in chs:
             lens_release(k)
             sm = rp2pio.StateMachine(NOISE_PROG, frequency=rate, first_out_pin=PIN_LENS[k][0],

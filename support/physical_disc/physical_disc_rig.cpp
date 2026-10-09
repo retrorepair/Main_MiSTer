@@ -97,6 +97,14 @@ static void nap_ms(double ms)
 //
 // Levels are the firmware's LENS Z levels: 1 = about 0.3 V RMS across the coil, 2 = 0.9 V, 3 = 2.5 V
 // (burst only, 1.5 s at most); the BA5977FP channels give 5 V x duty at most (datasheet).
+//
+// The noise is random pulses at NOISE_HZ pulses per second. MEASURED with a microphone beside the rig
+// (level 2 bursts at pulse rates from 64 kHz to 2 kHz): the pickup radiates almost nothing below 2 kHz
+// whatever is fed to it and most of it at 4-14 kHz; a lower pulse rate only raises the 4-11 kHz level. A
+// real PlayStation reading is 9-12 dB above its idle floor at 4-8 kHz (the recording), and level 2 at
+// 8 kHz gives 12 dB there on the rig, so that is what the steady noise uses.
+#define NOISE_HZ  8000
+#define BEEP_SHAPE "t"      // "t" triangle (as asked), "s" sine (measured closer to the recording)
 struct lens_policy {
 	int focus_ms;      // boot: focus-search ramp after the sled homes (0 = none)
 	int beep;          // boot: the CXD2545Q auto-gain tone after focus is found
@@ -109,7 +117,7 @@ struct lens_policy {
 static const struct lens_policy policies[PD_ACU_PROFILE_COUNT] = {
 	// focus beep read seek relock kick     (profile order is the pd_acoustic_profile_t order)
 	{     0,  0,   0,   2,   100,   0   },   // auto: no console claimed yet, so nothing to imitate: just home
-	{   300,  1,   1,   0,   150,   500 },   // PlayStation: the one with a recording behind it
+	{   300,  1,   2,   0,   150,   500 },   // PlayStation: the one with a recording behind it
 	{  2000,  0,   0,   2,   100,   0   },   // Mega CD: focus search about 2 s (service manual flowchart)
 	{  3000,  0,   0,   2,   100,   0   },   // Saturn: "approx. 3 seconds" of lens up and down (manual p.8)
 	{  2000,  0,   0,   2,   100,   0   },   // PC Engine CD: same Sony family as the Mega CD 2
@@ -334,8 +342,8 @@ static int wait_until(double end, int (*aborted)(void))
 static void lens_noise(int level)
 {
 	if (level == rig.noise) return;
-	char line[32];
-	if (level > 0) snprintf(line, sizeof(line), "LENS B Z %d 0", level);
+	char line[40];
+	if (level > 0) snprintf(line, sizeof(line), "LENS B Z %d 0 %d", level, NOISE_HZ);
 	else           snprintf(line, sizeof(line), "LENS OFF");
 	if (cmd(line, REPLY_MS)) rig.noise = level;
 }
@@ -345,8 +353,8 @@ static void lens_noise(int level)
 static void lens_burst(int level, double ms)
 {
 	if (level <= 0 || ms < 20.0) return;
-	char line[32];
-	snprintf(line, sizeof(line), "LENS B Z %d %d", level, (int)ms);
+	char line[40];
+	snprintf(line, sizeof(line), "LENS B Z %d %d %d", level, (int)ms, NOISE_HZ);
 	cmd(line, REPLY_MS);
 	rig.noise = 0;
 }
@@ -371,9 +379,15 @@ static int lens_boot(int (*aborted)(void))
 	}
 	if (p->beep) {
 		// CXD2545Q AGCNTL: a 1 kHz sine into the loop. The recording has it at 1004 Hz for 0.4 s. A square
-		// pulse train sounded far too sharp on the rig, so it is a triangle: peak 0.5 of the 5 V swing,
-		// which has the same fundamental as the pulse train it replaced.
-		cmd("LENS F G 0.5 400 1000", REPLY_MS);
+		// pulse train sounded far too sharp on the rig, so it is a triangle ("t") at the owner's word:
+		// peak 0.5 of the 5 V swing. MEASURED with a microphone beside the rig: the 1 kHz line is +14 dB
+		// over its surroundings at 0.5, like the recording's +15, but the pickup radiates a 3 kHz harmonic
+		// far better than 1 kHz, so the triangle's third harmonic reads +10 dB ABOVE the fundamental; a
+		// sine ("s") brings that down to about equal. The recording is a pure tone, so "s" matches it
+		// better; BEEP_SHAPE is the one word to change if the owner agrees.
+		char tone[48];
+		snprintf(tone, sizeof(tone), "LENS F G 0.5 400 1000 %s", BEEP_SHAPE);
+		cmd(tone, REPLY_MS);
 		if (wait_until(now_ms() + 400.0, aborted)) return 1;
 	}
 	return 0;

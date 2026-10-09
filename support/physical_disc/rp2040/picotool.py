@@ -188,37 +188,48 @@ def cmd_repl(args):
 
 
 def cmd_deploy(args):
+    """Upload a file over the REPL by streaming it to flash in 75-byte pieces (the whole file never has to
+    fit in the board's RAM: at 31 KB it no longer did), read it back to check the CRC, and only then reset
+    the board. The REPL occasionally drops characters when the host is busy, so a mismatch is retried,
+    more slowly each time, instead of being left in place."""
     data = open(args.file, "rb").read()
     b64 = base64.b64encode(data).decode()
     crc = binascii.crc32(data) & 0xFFFFFFFF
-    fd = open_raw(args.port)
-    os.write(fd, b"\x03")
-    read_for(fd, 0.5)
-    os.write(fd, b"\x03")
-    read_for(fd, 0.7)
-    os.write(fd, b"\r")
-    read_for(fd, 0.4)
-    cmds = ["import binascii, gc, os", "gc.collect()", "B = b''"]
-    for i in range(0, len(b64), 100):
-        cmds.append("B += b'%s'" % b64[i:i + 100])
-    cmds += ["D = binascii.a2b_base64(B)", "B = None", "gc.collect()",
-             "print('DECODED', len(D), hex(binascii.crc32(D)))",
-             "g = open('%s', 'wb')" % args.dest, "print('WRITE', g.write(D))", "g.flush()", "g.close()",
-             "R = open('%s','rb').read()" % args.dest, "print('NOW', len(R), hex(binascii.crc32(R)))"]
-    log = ""
-    for c in cmds:
-        os.write(fd, (c + "\r").encode())
-        log += read_for(fd, 0.12)
-    log += read_for(fd, 1.0)
-    for l in log.splitlines():
-        if any(k in l for k in ("DECODED", "WRITE", "NOW", "Error", "Traceback", "Memory")) and not l.startswith(">>> "):
-            print(l)
-    print("expected: len %d, crc 0x%x" % (len(data), crc))
-    os.write(fd, b"import microcontroller\r")
-    read_for(fd, 0.3)
-    os.write(fd, b"microcontroller.reset()\r")
-    read_for(fd, 0.3)
-    os.close(fd)
+    check = ("exec(\"c=0;n=0;r=open('%s','rb')\\nwhile True:\\n b=r.read(512)\\n if not b: break\\n"
+             " c=binascii.crc32(b,c);n+=len(b)\\nr.close();print('NOW',n,hex(c))\")" % args.dest)
+    for attempt in range(1, 6):
+        fd = open_raw(args.port)
+        os.write(fd, b"\x03")
+        read_for(fd, 0.5)
+        os.write(fd, b"\x03")
+        read_for(fd, 0.7)
+        os.write(fd, b"\r")
+        read_for(fd, 0.4)
+        cmds = ["import binascii, gc, os", "gc.collect()", "g = open('%s', 'wb')" % args.dest]
+        for i in range(0, len(b64), 100):
+            cmds.append("g.write(binascii.a2b_base64(b'%s'))" % b64[i:i + 100])
+        cmds += ["g.flush()", "g.close()", check]
+        log = ""
+        for c in cmds:
+            os.write(fd, (c + "\r").encode())
+            log += read_for(fd, 0.1 * attempt)
+        log += read_for(fd, 1.5)
+        now = [l.split() for l in log.splitlines() if l.startswith("NOW")]
+        ok = bool(now) and now[-1] == ["NOW", str(len(data)), hex(crc)]
+        for l in log.splitlines():
+            if any(k in l for k in ("NOW", "Error", "Traceback", "Memory")) and not l.startswith(">>> "):
+                print(l)
+        print("attempt %d: expected len %d, crc 0x%x -> %s" % (attempt, len(data), crc, "OK" if ok else "MISMATCH"))
+        if ok:
+            os.write(fd, b"import microcontroller\r")
+            read_for(fd, 0.3)
+            os.write(fd, b"microcontroller.reset()\r")
+            read_for(fd, 0.3)
+            os.close(fd)
+            return
+        os.close(fd)
+    print("deploy FAILED: the board still holds a bad file")
+    sys.exit(1)
 
 
 def main():
