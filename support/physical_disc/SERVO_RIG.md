@@ -285,6 +285,10 @@ takes 1.85-1.92 s against 1.92 asked.
   drive read-only to the PC, so this is the only way to change files.
 * `replay.ps1` plays the Sonic CD data->CDDA seek out and back, with the spindle glide.
 * `chars.ps1`, `driveprobe.ps1` measure true travel and speed against the ruler.
+* `picotool.py` does the same jobs from the MiSTer (python3, no pyserial there) when the Pico is
+  plugged into it: `find` tells the console port from the data port, `send` and `steps` talk to the
+  protocol, `deploy` uploads firmware. Leave the core, so the rig backend lets go of the port,
+  before using it.
 * `hosttest/run.sh` runs the MiSTer-side translator against a fake board on a pty in real
   time, using the real acoustic model.
 
@@ -309,8 +313,12 @@ on the move. After three unanswered commands it drops the port and probes again 
 
 ### Still open
 
-* Spindle duty to rpm is a guess (0.64 at 241 rpm, 0.76 at 431 rpm); the PS1 spindle
-  response has not been measured.
+* Spindle duty to rpm is set by ear, not measured: stepping 0.53-0.62 was smooth and 0.66 and
+  0.70 were loud, like something hitting, so the hub is 0.61, the rim 0.57 and the firmware caps
+  the duty at 0.62. The real rpm at those duties is unknown; the glide shape is right, the
+  absolute speed may not be.
+* `CD_COMM_TRACK_MOVE` in the Mega CD core pauses without moving its own position, so it is left
+  silent: a seek noise for it would be followed by a seek back when the next read arrived.
 * The ear verdict on the protocol-driven playback has not been taken yet, and the MiSTer
   end-to-end test needs the Pico moved onto a MiSTer USB port.
 * The lens coils (ch1/ch2, IC722 pins 4-7) could add focus rattle; unused.
