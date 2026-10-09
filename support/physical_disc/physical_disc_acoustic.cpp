@@ -1856,6 +1856,7 @@ static void *worker_main(void *arg)
 			has_stash = 0;
 		}
 		else if (!acu_model_poll(&model, &g)) {
+			if (cfg.physical_disc_acoustic_rig) rig_keepalive();
 			sleep_ms(10);
 			continue;
 		}

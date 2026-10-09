@@ -32,6 +32,11 @@ void rig_play(const gesture_t *g, int (*aborted)(void));
 // physical_disc_rig.cpp for what is sourced and what is a best guess.
 void rig_set_profile(int profile);
 
+// Call regularly while idle: sends a PING if the board has heard nothing for a couple of seconds. The
+// board switches everything off when it hears nothing for 15 s, so a core that exits cannot leave the
+// spindle or the lens noise running.
+void rig_keepalive(void);
+
 // Optional trace sink; the player points this at its own log.
 void rig_set_log(void (*fn)(const char *line));
 

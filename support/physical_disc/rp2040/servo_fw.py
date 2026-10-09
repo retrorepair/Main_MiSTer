@@ -12,7 +12,8 @@
 #   DRIVE <out|in> <duty> <ms> -> OK, then DONE MOVE ...   (bench diagnostic, fixed duty)
 #   LENS <F|T|B> Z <level 1-3> <ms>   broadband noise on the coils from a random pulse stream played
 #                           by PIO and DMA (ms 0 = until LENS OFF; level 3 is limited to a short burst)
-#   LENS <F|T|B> G <amp> <ms> <hz>    a bipolar tone, e.g. the PS1's 1 kHz auto-gain beep
+#   LENS <F|T|B> G <peak> <ms> <hz>   a triangle tone (peak = duty of the 5 V swing, up to 0.6), e.g.
+#                           the PS1's 1 kHz auto-gain beep
 #   SPIN <rpm> <ms> [kick_ms]         optional kick: the spindle held at spin_kick for kick_ms first
 #   LENS <F|T|B> <N|D|R|S> <amp> <ms> [carrier] -> OK, then DONE LENS <ms>
 #                           drives the pickup's lens coils through IC722 ch1 (F, focus) and ch2
@@ -120,6 +121,8 @@ TEX = {
     "spin_lo": 0.57,    # spindle duty at 241 rpm (rim). By ear on the bench: steps 0.53-0.62
     "spin_hi": 0.61,    # were smooth, 0.66 and 0.70 were loud and sounded like something hitting,
                         # so the whole range stays under 0.62. Not measured against real rpm.
+    "host_timeout": 15.0,  # seconds without a word from the host before everything is switched off: a core that
+                           # exits leaves the spindle and the lens noise running otherwise
     "idle_mute": 1.5,   # seconds of stillness before the driver is muted
 }
 RPM_LO, RPM_HI = 241.0, 431.0
@@ -299,10 +302,29 @@ def lens_pio_stop():
     lens_buf = None
 
 
-def tone_prog(d):
-    """FIN pulse, idle, RIN pulse, idle: a bipolar square wave whose pulse width d/32 sets the level."""
-    return array.array("H", [0xE001 | (d << 8), 0xE000 | ((31 - d) << 8),
-                             0xE002 | (d << 8), 0xE000 | ((31 - d) << 8)])
+TONE_CARRIER = 25000                     # the tone is PWM at about this rate, inaudible and filtered by the coil
+TONE_MAX = 0.6                           # peak duty: 60% of the 5 V swing
+
+
+def make_tone(peak, hz):
+    """A triangle wave at hz built from 25 kHz PWM, as a looped buffer for the same PIO program as the noise.
+
+    Each carrier period is 32 symbols = 64 bits = two words; the leading symbols carry the pulse (1 = FIN,
+    2 = RIN) and their count is the duty. A square-edged pulse train sounded sharp and harsh, and its
+    odd harmonics fall off as 1/n; a triangle's fall as 1/n^2. The buffer starts at a zero crossing.
+    Returns (buffer, symbol rate)."""
+    a = min(max(peak, 0.0), TONE_MAX)
+    n = max(int(TONE_CARRIER / hz + 0.5), 2)             # carrier periods per tone cycle
+    buf = array.array("L", [0] * (2 * n))
+    for k in range(n):
+        ph = (k + 0.5) / n + 0.25
+        ph -= int(ph)
+        v = a * (1.0 - 4.0 * abs(ph - 0.5))              # -a .. +a, rising through zero at ph = 0.25
+        w = int(abs(v) * 32.0 + 0.5)
+        val = (((1 << (2 * w)) - 1) // 3) * (1 if v > 0.0 else 2)
+        buf[2 * k] = val & 0xFFFFFFFF
+        buf[2 * k + 1] = val >> 32
+    return buf, int(hz * n * 32)
 
 
 def lens_carrier(k, f):
@@ -521,19 +543,15 @@ def cmd_lens(args):
             elif ms <= 0.0:
                 T = 1.0e9                                       # until LENS OFF
             lens_buf = noise_bufs[level]
+            rate = NOISE_HZ
         else:
-            hz = float(args[4]) if len(args) > 4 else 1000.0
-            d = int(min(max(amp, 0.0), 0.4) * 31.0 + 0.5)       # tone level capped at 40% of the 5 V swing
+            lens_buf, rate = make_tone(amp, float(args[4]) if len(args) > 4 else 1000.0)
         for k in chs:
             lens_release(k)
-            if mode == "Z":
-                sm = rp2pio.StateMachine(NOISE_PROG, frequency=NOISE_HZ, first_out_pin=PIN_LENS[k][0],
-                                         out_pin_count=2, auto_pull=True, pull_threshold=32,
-                                         out_shift_right=True)
-                sm.background_write(loop=lens_buf)
-            else:
-                sm = rp2pio.StateMachine(tone_prog(d), frequency=int(hz * 66), first_set_pin=PIN_LENS[k][0],
-                                         set_pin_count=2)
+            sm = rp2pio.StateMachine(NOISE_PROG, frequency=rate, first_out_pin=PIN_LENS[k][0],
+                                     out_pin_count=2, auto_pull=True, pull_threshold=32,
+                                     out_shift_right=True)
+            sm.background_write(loop=lens_buf)
             lens_pio[k] = sm
         j = Mv()
         j.chs, j.mode, j.amp, j.T = chs, mode, amp, T
@@ -605,7 +623,7 @@ def cmd_spin(args):
     say("OK")
 
 
-def cmd_stop():
+def park_all():
     global mv, spin_ramp, spin_rpm, spin_duty
     mv = None
     coast()
@@ -615,11 +633,19 @@ def cmd_stop():
     spin_duty = SPIN_STOP_DUTY
     spin.duty_cycle = u16(SPIN_STOP_DUTY)
     set_mute(True)
+
+
+def cmd_stop():
+    park_all()
     say("OK")
 
 
+last_host = time.monotonic_ns()      # when a line last arrived from the host
+
+
 def handle(line):
-    global INV
+    global INV, last_host
+    last_host = time.monotonic_ns()
     parts = line.split()
     if not parts:
         return
@@ -783,6 +809,14 @@ def step():
         spin_duty = r[2] + (r[3] - r[2]) * f
         spin.duty_cycle = u16(spin_duty)
         last_active = ns
+
+    # The host has gone quiet (its process ended, the core was left): do not keep turning, driving or
+    # hissing on the last command. The host pings every couple of seconds while it is alive.
+    global last_host
+    if (ns - last_host) * 1e-9 > TEX["host_timeout"]:
+        last_host = ns
+        if spin_rpm > 0.0 or lens_job is not None or mv is not None or not muted:
+            park_all()
 
     # Silence the driver when nothing is going on: the parked spindle input creeps.
     if (not muted) and mv is None and lens_job is None and spin_rpm <= 0.0 and spin_ramp is None:

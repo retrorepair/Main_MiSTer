@@ -45,7 +45,9 @@ static struct {
 
 	const struct lens_policy *pol;   // what this console's lens coils do (set by rig_set_profile)
 	int    noise;             // continuous coil noise level the board is running (0 = none)
-} rig = { -1, {0}, 0, {0}, 0, 0, 0, 0, 0, 0, -1, NULL, 0 };
+	int    booted;            // the boot lens sequence has been played for this disc already
+	double last_tx_ms;        // when we last sent the board anything
+} rig = { -1, {0}, 0, {0}, 0, 0, 0, 0, 0, 0, -1, NULL, 0, 0, 0.0 };
 
 static void (*g_log)(const char *line);
 
@@ -106,7 +108,7 @@ struct lens_policy {
 
 static const struct lens_policy policies[PD_ACU_PROFILE_COUNT] = {
 	// focus beep read seek relock kick     (profile order is the pd_acoustic_profile_t order)
-	{  1000,  0,   0,   2,   100,   0   },   // auto: the generic row, no console claimed
+	{     0,  0,   0,   2,   100,   0   },   // auto: no console claimed yet, so nothing to imitate: just home
 	{   300,  1,   1,   0,   150,   500 },   // PlayStation: the one with a recording behind it
 	{  2000,  0,   0,   2,   100,   0   },   // Mega CD: focus search about 2 s (service manual flowchart)
 	{  3000,  0,   0,   2,   100,   0   },   // Saturn: "approx. 3 seconds" of lens up and down (manual p.8)
@@ -181,6 +183,7 @@ static int send_line(const char *line)
 {
 	if (rig.fd < 0) return -1;
 	char buf[96];
+	rig.last_tx_ms = now_ms();
 	int n = snprintf(buf, sizeof(buf), "%s\n", line);
 	for (int tries = 0; tries < 50; tries++) {
 		ssize_t w = write(rig.fd, buf, n);
@@ -214,6 +217,16 @@ static const char *cmd(const char *line, int timeout_ms)
 }
 
 int rig_connected(void) { return rig.fd >= 0; }
+
+// The board switches everything off if the host goes quiet (a core that exits leaves nothing to stop it),
+// so while we are alive say something at least every couple of seconds.
+#define KEEPALIVE_MS  2000
+void rig_keepalive(void)
+{
+	if (rig.fd < 0) return;
+	if (now_ms() - rig.last_tx_ms < KEEPALIVE_MS) return;
+	cmd("PING", REPLY_MS);
+}
 
 static int vendor_ok(int n)
 {
@@ -267,6 +280,7 @@ int rig_connect(void)
 			// Whatever it was doing when we found it, start from a known quiet state.
 			cmd("STOP", REPLY_MS);
 			rig.noise = 0;
+			rig.booted = 0;
 			rig.spin_rpm = 0.0;
 			rig.pos_pm   = 0;
 			rig.sent_smooth = -1;
@@ -286,6 +300,7 @@ void rig_disconnect(int park)
 	if (rig.fd < 0) return;
 	if (park) cmd("STOP", REPLY_MS);
 	rig.noise = 0;
+	rig.booted = 0;
 	if (rig.fd >= 0) close(rig.fd);
 	rig.fd = -1;
 	rig.rxn = 0;
@@ -343,14 +358,22 @@ static int lens_boot(int (*aborted)(void))
 	const struct lens_policy *p = rig.pol;
 	char line[48];
 	rig.noise = 0;
+	// A drive starts up once per disc. The core announces the mount more than once (before and after it
+	// names its console, and again later), and each announcement is a TRAY_CLOSE, so without this the
+	// focus search and the tone play two or three times in a row. Only a console's own policy counts:
+	// the generic one has nothing to play and must not use up the boot.
+	if (rig.booted || (p->focus_ms <= 0 && !p->beep)) return 0;
+	rig.booted = 1;
 	if (p->focus_ms > 0) {
 		snprintf(line, sizeof(line), "LENS F S 1 %d", p->focus_ms);
 		cmd(line, REPLY_MS);
 		if (wait_until(now_ms() + p->focus_ms, aborted)) return 1;
 	}
 	if (p->beep) {
-		// CXD2545Q AGCNTL: a 1 kHz sine into the loop. The recording has it at 1004 Hz for 0.4 s.
-		cmd("LENS F G 0.19 400 1000", REPLY_MS);
+		// CXD2545Q AGCNTL: a 1 kHz sine into the loop. The recording has it at 1004 Hz for 0.4 s. A square
+		// pulse train sounded far too sharp on the rig, so it is a triangle: peak 0.5 of the 5 V swing,
+		// which has the same fundamental as the pulse train it replaced.
+		cmd("LENS F G 0.5 400 1000", REPLY_MS);
 		if (wait_until(now_ms() + 400.0, aborted)) return 1;
 	}
 	return 0;
@@ -526,6 +549,7 @@ void rig_play(const gesture_t *g, int (*aborted)(void))
 	}
 
 	case GEST_PARK:
+		rig.booted = 0;            // the tray is opening: the next disc starts up afresh
 		lens_noise(0);
 		do_spin(0.0, dur, 1, 0);
 		if (!do_move(0, dur, t0, aborted, 1)) wait_until(end, aborted);

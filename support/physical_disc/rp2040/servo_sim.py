@@ -261,8 +261,16 @@ check("with a buffer whose density matches level 2", abs(sum(bin(w).count("1") f
 advance(0.5)
 out = W.tx.decode(); W.tx = b""
 check("and ends with DONE LENS, pins back on PWM", "DONE LENS" in out and not ns["lens_pio"] and ns["lens"]["F"] is not None, out.strip().replace("\n", " | "))
-send("LENS F G 0.2 200 1000", 0.05)
-check("LENS G plays a tone with a 4-instruction program", len(ns["lens_pio"]) == 1 and len(ns["lens_pio"]["F"].program) == 4)
+send("LENS F G 0.5 200 1000", 0.05)
+check("LENS G plays a tone from a 25-period buffer at 800 kHz", len(ns["lens_pio"]) == 1 and len(ns["lens_buf"]) == 50 and ns["lens_pio"]["F"].frequency == 800000)
+widths = []
+for i in range(0, 50, 2):
+    val = ns["lens_buf"][i] | (ns["lens_buf"][i + 1] << 32)
+    sy = [(val >> (2 * j)) & 3 for j in range(32)]
+    widths.append(sy.count(1) - sy.count(2))
+check("which is a triangle: peak about 16 of 32, equal positive and negative area, rising then falling",
+      14 <= max(widths) <= 16 and -16 <= min(widths) <= -14 and abs(sum(widths)) <= 2 and widths.index(max(widths)) in (5, 6, 7) and widths.index(min(widths)) in (18, 19, 20) and abs(widths[0]) <= 2,
+      str(widths))
 advance(0.4)
 out = W.tx.decode(); W.tx = b""
 check("and finishes", "DONE LENS" in out and not ns["lens_pio"], out.strip().replace("\n", " | "))
@@ -282,6 +290,13 @@ advance(1.0)
 check("SPIN with a kick holds the kick duty first, then settles lower", abs(d_kick - ns["TEX"]["spin_kick"]) < 0.01 and W.spin < d_kick - 0.005, "kick %.3f then %.3f" % (d_kick, W.spin))
 send("SPIN 0 100"); advance(0.3)
 
+# The host going quiet switches everything off, and talking keeps it alive.
+send("SPIN 400 100", 0.02); send("LENS B Z 1 0", 0.02)
+advance(10.0)
+send("PING"); advance(10.0)
+check("a host that talks every 10 s keeps the spindle and noise running", ns["spin_rpm"] > 0.0 and ns["lens_job"] is not None)
+advance(7.0)
+check("a silent host: spindle, noise and driver all switched off after the timeout", ns["spin_rpm"] == 0.0 and ns["lens_job"] is None and ns["muted"] and not ns["lens_pio"])
 send("STOP")
 check("STOP mutes and parks", W.muted_driver and abs(W.spin - 0.515) < 0.01)
 
