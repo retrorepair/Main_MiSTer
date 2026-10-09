@@ -10,6 +10,10 @@
 #   MOVE <permille> <ms>    -> OK <from> <to>, then DONE MOVE <pos> <ms> <reason>
 #                              (reason: target, home, limit, time, or stuck = never left the hub)
 #   DRIVE <out|in> <duty> <ms> -> OK, then DONE MOVE ...   (bench diagnostic, fixed duty)
+#   LENS <F|T|B> <N|D|R> <amp> <ms> [carrier] -> OK, then DONE LENS <ms>
+#                           drives the pickup's lens coils through IC722 ch1 (F, focus) and ch2
+#                           (T, tracking): N noise, D steady level, R ramp. amp is 0..1 of the
+#                           lens_max cap, so nothing here can exceed it. LENS OFF stops.
 #   SPIN <rpm> <ms>         -> OK         (0 rpm parks the spindle)
 #   TEX <name> <value>      -> OK         (texture/tuning parameters, see TEX below)
 #   MUTE <0|1>              -> OK         (1 disables the driver chip)
@@ -45,6 +49,9 @@ PIN_LIMIT = board.GP6
 PIN_MUTE = board.GP7
 PIN_SW = board.GP8
 PIN_SPIN = board.GP2
+# The lens coils, driven through IC722 channel 1 (focus, pins 4/5) and channel 2 (tracking, pins 6/7).
+# Which is which was read off how the lines nest on the PSone schematic; it is not yet confirmed.
+PIN_LENS = {"F": (board.GP10, board.GP11), "T": (board.GP12, board.GP13)}
 
 RUN_HIGH = True              # MUTE pin level that means "driver running"
 LIMIT_CLOSED_LOW = True
@@ -76,6 +83,9 @@ TEX = {
     "amp": 0.03,        # swell depth, in duty
     "grit": 0.12,       # random duty noise
     "bias": 0.0,        # added to every textured duty
+    "lens_max": 0.15,   # the most the lens drive may ever reach, as a duty (x7.4 V BTL): the coil is
+                        # fragile, so this stays low until it has been tuned by ear and by scope
+    "lens_carrier": 8000.0,  # PWM carrier of the noise drive: audible, so it is part of the sound
     "kick_min": 0.30,   # the textured drive's mean duty is tiny, so its kick and brake use at least this
     "kick_ms": 12.0,    # smooth moves start with a kick: the datasheet's sled kick (CXD2545Q p.30) is
     "kick_gain": 2.0,   # basic level x1..x4 for 2.9..23.2 ms. The levels here are a first guess
@@ -184,6 +194,13 @@ fin = pwmio.PWMOut(PIN_FIN, frequency=carrier, duty_cycle=0)
 rin = pwmio.PWMOut(PIN_RIN, frequency=carrier, duty_cycle=0)
 spin = pwmio.PWMOut(PIN_SPIN, frequency=CARRIER_PLAIN, duty_cycle=u16(SPIN_STOP_DUTY))
 
+lens = {}                                # "F"/"T" -> [fin, rin]
+lens_car = {}
+for _k in PIN_LENS:
+    lens[_k] = [pwmio.PWMOut(PIN_LENS[_k][0], frequency=CARRIER_PLAIN, duty_cycle=0),
+                pwmio.PWMOut(PIN_LENS[_k][1], frequency=CARRIER_PLAIN, duty_cycle=0)]
+    lens_car[_k] = CARRIER_PLAIN
+
 
 def load_dir():
     try:
@@ -217,6 +234,43 @@ def drive(outward, d):
     else:
         fin.duty_cycle = 0
         rin.duty_cycle = u16(d)
+
+
+def lens_carrier(k, f):
+    f = int(f)
+    if lens_car[k] == f:
+        return
+    lens[k][0].deinit()
+    lens[k][1].deinit()
+    lens[k] = [pwmio.PWMOut(PIN_LENS[k][0], frequency=f, duty_cycle=0),
+               pwmio.PWMOut(PIN_LENS[k][1], frequency=f, duty_cycle=0)]
+    lens_car[k] = f
+
+
+def lens_level(k, x):
+    """x in -1..1 of the lens_max cap: positive on FIN, negative on RIN, never past the cap."""
+    if x > 1.0:
+        x = 1.0
+    elif x < -1.0:
+        x = -1.0
+    d = abs(x) * TEX["lens_max"]
+    if x >= 0.0:
+        lens[k][0].duty_cycle = u16(d)
+        lens[k][1].duty_cycle = 0
+    else:
+        lens[k][0].duty_cycle = 0
+        lens[k][1].duty_cycle = u16(d)
+
+
+def lens_off():
+    global lens_job
+    lens_job = None
+    for k in lens:
+        lens[k][0].duty_cycle = 0
+        lens[k][1].duty_cycle = 0
+
+
+lens_job = None
 
 
 def coast():
@@ -361,6 +415,35 @@ def cmd_move(args):
     say("OK %d %d" % (int(pos * 1000), int(target * 1000)))
 
 
+def cmd_lens(args):
+    """LENS <F|T|B> <N|D|R> <amp> <ms> [carrier], or LENS OFF."""
+    global lens_job
+    if args[0].upper() == "OFF":
+        lens_off()
+        say("OK")
+        return
+    chs = ("F", "T") if args[0].upper() == "B" else (args[0].upper(),)
+    mode = args[1].upper()
+    amp = float(args[2])
+    T = max(float(args[3]), 20.0) / 1000.0
+    if mode not in ("N", "D", "R"):
+        say("ERR mode")
+        return
+    for k in chs:
+        if k not in lens:
+            say("ERR channel")
+            return
+    car = float(args[4]) if len(args) > 4 else (TEX["lens_carrier"] if mode == "N" else CARRIER_PLAIN)
+    wake()
+    for k in chs:
+        lens_carrier(k, car)
+    j = Mv()
+    j.chs, j.mode, j.amp, j.T = chs, mode, amp, T
+    j.t0 = time.monotonic_ns()
+    lens_job = j
+    say("OK")
+
+
 def cmd_drive(args):
     """DRIVE <out|in> <duty> <ms>: textured drive at a fixed duty for a fixed time.
 
@@ -404,6 +487,7 @@ def cmd_stop():
     global mv, spin_ramp, spin_rpm, spin_duty
     mv = None
     coast()
+    lens_off()
     spin_ramp = None
     spin_rpm = 0.0
     spin_duty = SPIN_STOP_DUTY
@@ -432,6 +516,8 @@ def handle(line):
             cmd_move(a)
         elif c == "DRIVE":
             cmd_drive(a)
+        elif c == "LENS":
+            cmd_lens(a)
         elif c == "SPIN":
             cmd_spin(a)
         elif c == "TEX":
@@ -529,6 +615,24 @@ def step():
     else:
         led.value = False
 
+    global lens_job
+    lj = lens_job
+    if lj is not None:
+        last_active = ns
+        el = (ns - lj.t0) * 1e-9
+        if el >= lj.T:
+            lens_off()
+            say("DONE LENS %d" % int(lj.T * 1000))
+        else:
+            for k in lj.chs:
+                if lj.mode == "N":
+                    x = lj.amp * (random.random() * 2.0 - 1.0)
+                elif lj.mode == "D":
+                    x = lj.amp
+                else:
+                    x = lj.amp * (2.0 * el / lj.T - 1.0)
+                lens_level(k, x)
+
     r = spin_ramp
     if r is not None:
         f = (ns - r[0]) * 1e-9 / r[1]
@@ -540,7 +644,7 @@ def step():
         last_active = ns
 
     # Silence the driver when nothing is going on: the parked spindle input creeps.
-    if (not muted) and mv is None and spin_rpm <= 0.0 and spin_ramp is None:
+    if (not muted) and mv is None and lens_job is None and spin_rpm <= 0.0 and spin_ramp is None:
         if (ns - last_active) * 1e-9 > TEX["idle_mute"]:
             set_mute(True)
 

@@ -24,6 +24,7 @@ class World:
     muted_driver = True
     spin = 0.515
     log_pos = []
+    lens_max = 0.0            # the highest lens duty ever seen
     jam = False               # the carriage will not leave the hub
 
 W = World()
@@ -34,7 +35,7 @@ class Pin:
     def __repr__(self): return self.name
 
 board = types.ModuleType("board")
-for n in ("GP2", "GP4", "GP5", "GP6", "GP7", "GP8", "LED"):
+for n in ("GP2", "GP4", "GP5", "GP6", "GP7", "GP8", "GP10", "GP11", "GP12", "GP13", "LED"):
     setattr(board, n, Pin(n))
 
 class DIO:
@@ -67,6 +68,7 @@ class PWM:
         if self.pin == "GP4": W.duty["fin"] = f
         if self.pin == "GP5": W.duty["rin"] = f
         if self.pin == "GP2": W.spin = f
+        if self.pin in ("GP10", "GP11", "GP12", "GP13"): W.lens_max = max(W.lens_max, f)
     def deinit(self): self.alive = False
 
 class Serial:
@@ -216,6 +218,17 @@ out = W.tx.decode(); W.tx = b""
 check("a jammed sled ends the move as stuck", "stuck" in out and not ns["mv"], out.strip().replace("\n", " | "))
 W.jam = False
 check("and the position is the hub", ns["pos"] == 0.0 and ns["known"])
+
+# The lens drive: noise for a while, capped, then reports done; nothing can exceed lens_max.
+W.lens_max = 0.0
+r = send("LENS B N 1 300", 0.05); advance(0.5)
+out = W.tx.decode(); W.tx = b""
+check("LENS noise runs and ends with DONE LENS", "DONE LENS" in out, out.strip().replace("\n", " | "))
+check("and never exceeds the lens_max cap", 0.0 < W.lens_max <= ns["TEX"]["lens_max"] + 0.001, "%.3f" % W.lens_max)
+W.lens_max = 0.0
+send("LENS F D 9 200", 0.05); advance(0.4); W.tx = b""
+check("an oversize amplitude is clamped to the cap", 0.0 < W.lens_max <= ns["TEX"]["lens_max"] + 0.001, "%.3f" % W.lens_max)
+check("a bad channel is rejected", send("LENS Q N 1 100")[0].startswith("ERR"))
 
 send("STOP")
 check("STOP mutes and parks", W.muted_driver and abs(W.spin - 0.515) < 0.01)

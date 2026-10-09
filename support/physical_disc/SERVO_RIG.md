@@ -311,6 +311,30 @@ time the original drive would have taken.
 If the board reports `ERR notknown` the translator homes and spends what is left of the time
 on the move. After three unanswered commands it drops the port and probes again each second.
 
+### The lens coils (planned wiring, route 2)
+
+The hiss in the Mega CD clip is probably the pickup's own lens actuators (focus and tracking coils), which
+the service manual shows driven with a noisy waveform the whole time. To play that, the Pico drives IC722's
+channel 1 and channel 2 inputs, the way it already drives channel 3 (sled) and channel 4 (spindle).
+
+| Pico | IC722 pin | function |
+|------|-----------|----------|
+| GP10 | 4 (CH1FIN) | focus coil, forward |
+| GP11 | 5 (CH1RIN) | focus coil, reverse |
+| GP12 | 6 (CH2FIN) | tracking coil, forward |
+| GP13 | 7 (CH2RIN) | tracking coil, reverse |
+
+Channel 1 = focus and channel 2 = tracking is read from how the output lines nest on the way to the pickup
+connector CN702 (pins 13 FCS+, 14 TRK+, 15 TRK-, 16 FCS-); it is not yet confirmed. The board's own DSP still
+drives pins 4-7, so they must be lifted from the board (or their traces cut) before the Pico is connected, as
+was done for the sled. The pickup flex goes into CN702, but the laser diode is on CN702 pins 1 (LD) and 2 (VCC)
+and the board can switch it on by itself, so those two flex conductors must be insulated, and ideally the laser
+driver Q701 removed. The laser is infrared and invisible.
+
+Firmware: `LENS <F|T|B> <N|D|R> <amp> <ms> [carrier]` (noise, steady level, ramp), `LENS OFF`. `amp` is a
+fraction of `TEX lens_max` (default 0.15 of the 7.4 V supply), so no command can exceed that cap; raise it only
+after watching the lens on a scope.
+
 ### Still open
 
 * Spindle duty to rpm is set by ear, not measured: stepping 0.53-0.62 was smooth and 0.66 and
