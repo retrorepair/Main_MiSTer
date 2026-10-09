@@ -8,6 +8,7 @@
 #   ST                      -> ST pos=<permille> known=<0|1> moving=<0|1> ...
 #   HOME [duty]             -> OK, then DONE HOME <ms> <reason>   (inward to the switch)
 #   MOVE <permille> <ms>    -> OK <from> <to>, then DONE MOVE <pos> <ms> <reason>
+#                              (reason: target, home, limit, time, or stuck = never left the hub)
 #   DRIVE <out|in> <duty> <ms> -> OK, then DONE MOVE ...   (bench diagnostic, fixed duty)
 #   SPIN <rpm> <ms>         -> OK         (0 rpm parks the spindle)
 #   TEX <name> <value>      -> OK         (texture/tuning parameters, see TEX below)
@@ -303,8 +304,8 @@ def finish(reason):
     ms = int((time.monotonic_ns() - m.t0) / 1000000)
     if reason == "time" and (m.kind == "home" or m.target <= 0.0):
         known = False             # it never reached the switch: position is unknown
-    if reason == "home":
-        pos = 0.0
+    if reason == "home" or reason == "stuck":
+        pos = 0.0               # it is on the hub switch, so that is where it is
         known = True
     say("DONE %s %d %d %s" % ("HOME" if m.kind == "home" else "MOVE", int(pos * 1000), ms, reason))
 
@@ -514,6 +515,10 @@ def step():
         elif m.kind == "move" and m.target > 0.0 and (
                 (m.outward and pos >= m.target) or ((not m.outward) and pos <= m.target)):
             end = "target"
+        elif m.outward and m.kind != "home" and el > 0.6 and pos > 0.15 and at_home():
+            # Driving outward and still sitting on the hub switch: the carriage is jammed (it was,
+            # once, for an hour, while every move reported success). Stop instead of pushing on.
+            end = "stuck"
         elif m.outward and pos >= 0.97:
             end = "limit"
         elif el >= m.limit_s:

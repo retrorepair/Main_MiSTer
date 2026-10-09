@@ -6,6 +6,7 @@ pyserial, when the Pico is plugged into it instead of the PC. Standard library o
     picotool.py send  <data-port> "TEX spin_lo 0.55" "SPIN 241 300" [--wait 0.3]
     picotool.py steps <data-port> 0.53,0.55,0.57 [--on 4] [--off 2]
     picotool.py script <data-port> "SPIN 241 300" @sleep=1 "DRIVE out 0.11 1000" @done "HOME 0.5" @done
+    picotool.py repl <console-port> "import board" "print(board.GP4)" [--gap 0.15]   (stops code.py first)
     picotool.py deploy <console-port> <file> [--dest /code.py]
     picotool.py grain <data-port> "A:grit=0.06;B:grit=0.12,carrier=300" [--pause 2.5]
 
@@ -167,6 +168,22 @@ def cmd_script(args):
     os.close(fd)
 
 
+def cmd_repl(args):
+    """Interrupt code.py and run lines at the REPL (one per call to read, --gap apart); prints the
+    echo. Use for bypassing servo_fw.py entirely. Leaves the REPL at the prompt: finish with a line
+    like "import microcontroller; microcontroller.reset()" to restart code.py."""
+    fd = open_raw(args.port)
+    os.write(fd, b"\x03"); read_for(fd, 0.5)
+    os.write(fd, b"\x03"); read_for(fd, 0.7)
+    os.write(fd, b"\r"); read_for(fd, 0.4)
+    for ln in args.lines:
+        os.write(fd, (ln + "\r").encode())
+        out = read_for(fd, args.gap)
+        print(out.replace("\r", "").rstrip())
+    print(read_for(fd, 0.5).replace("\r", "").rstrip())
+    os.close(fd)
+
+
 def cmd_deploy(args):
     data = open(args.file, "rb").read()
     b64 = base64.b64encode(data).decode()
@@ -214,6 +231,8 @@ def main():
     p.add_argument("--pause", type=float, default=2.5); p.set_defaults(f=cmd_grain)
     p = sub.add_parser("script"); p.add_argument("port"); p.add_argument("steps", nargs="+")
     p.set_defaults(f=cmd_script)
+    p = sub.add_parser("repl"); p.add_argument("port"); p.add_argument("lines", nargs="+")
+    p.add_argument("--gap", type=float, default=0.15); p.set_defaults(f=cmd_repl)
     p = sub.add_parser("deploy"); p.add_argument("port"); p.add_argument("file")
     p.add_argument("--dest", default="/code.py"); p.set_defaults(f=cmd_deploy)
     a = ap.parse_args()

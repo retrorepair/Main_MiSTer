@@ -90,6 +90,15 @@ static void got_line(char *line)
 	if (!strncmp(line, "DONE ", 5)) {
 		rig.done_seq++;
 		rlog("rig:   %s\n", line);
+		if (strstr(line, " stuck")) {
+			// The board gave up on an outward move because the carriage never left the hub switch.
+			// Once it sat jammed for an hour while every move reported success; say so loudly.
+			static double last_msg = -1e9;
+			if (now_ms() - last_msg > 30000.0) {
+				last_msg = now_ms();
+				printf("physical_disc_acoustic: the rig sled did not leave the hub (jammed?)\n");
+			}
+		}
 		return;
 	}
 	strncpy(rig.reply, line, sizeof(rig.reply) - 1);

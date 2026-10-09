@@ -24,6 +24,7 @@ class World:
     muted_driver = True
     spin = 0.515
     log_pos = []
+    jam = False               # the carriage will not leave the hub
 
 W = World()
 CURVE = None  # filled from the firmware once loaded
@@ -110,6 +111,8 @@ def advance(seconds, dt=0.002):
             out_d = fin if not inv else rin
             in_d = rin if not inv else fin
             v = (true_speed(out_d, True) if out_d > 0 else 0.0) - (true_speed(in_d, False) if in_d > 0 else 0.0)
+            if W.jam and W.pos <= 0.0 and v > 0.0:
+                v = 0.0
             W.pos = min(1.0, max(0.0, W.pos + v * dt))
         ns["step"]()
         W.log_pos.append(W.pos)
@@ -203,6 +206,16 @@ send("TEX smooth 1")
 r = send("MOVE 500 800", 0.05); advance(1.2)
 check("smooth MOVE reaches roughly the target", 0.25 < W.pos < 0.9 and not ns["mv"], "true %.3f" % W.pos)
 send("TEX smooth 0")
+
+# A jammed carriage: an outward move that never leaves the hub is reported, not pushed on with.
+send("HOME", 0.05); advance(6.0)
+W.jam = True
+r = send("MOVE 600 2000", 0.05)
+advance(1.0)
+out = W.tx.decode(); W.tx = b""
+check("a jammed sled ends the move as stuck", "stuck" in out and not ns["mv"], out.strip().replace("\n", " | "))
+W.jam = False
+check("and the position is the hub", ns["pos"] == 0.0 and ns["known"])
 
 send("STOP")
 check("STOP mutes and parks", W.muted_driver and abs(W.spin - 0.515) < 0.01)
