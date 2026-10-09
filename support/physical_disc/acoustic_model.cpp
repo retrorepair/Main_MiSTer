@@ -95,7 +95,10 @@ static const acu_drive_t drives[PD_ACU_PROFILE_COUNT] = {
 	{ "CDi",       1.0, 1.0,  24,  480,   60,   240,  1500,  2400, 9000,  4, 0,   5 },
 	// Neo Geo CD: 1x top loader, famously slow. Same CDD family as the Mega CD,
 	// so the same base and stroke, with a slower mechanism around it.
-	{ "NeoGeoCD",  1.0, 1.0,  24,  480,   70,   200,  1700,  2500, 8000,  4, 1,   6 },
+	// calib_sweep 2: the top-loading Neo Geo CD drive is built from the same Sony parts as the Mega CD
+	// (CXP5084 mecha-con, CXD2500 DSP, CXA1372 servo; wiki.neogeodev.org/index.php/CD_drive), so it
+	// boots the way the Mega CD 2 service manual says: home the sled, then focus, spindle, tracking.
+	{ "NeoGeoCD",  1.0, 1.0,  24,  480,   70,   200,  1700,  2500, 8000,  4, 2,   6 },
 };
 
 const acu_drive_t *acu_model_drive(pd_acoustic_profile_t profile)
