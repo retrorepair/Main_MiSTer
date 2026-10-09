@@ -78,8 +78,9 @@ TEX = {
     "eff": 1.0,         # scales the textured speed the firmware believes (bench tuning)
     "min": 0.02,        # moves shorter than this fraction of the stroke are skipped
     "snap": 0.08,       # targets below this snap to the switch
-    "spin_lo": 0.64,    # spindle duty at 241 rpm (rim)
-    "spin_hi": 0.76,    # spindle duty at 431 rpm (hub)
+    "spin_lo": 0.57,    # spindle duty at 241 rpm (rim). By ear on the bench: steps 0.53-0.62
+    "spin_hi": 0.61,    # were smooth, 0.66 and 0.70 were loud and sounded like something hitting,
+                        # so the whole range stays under 0.62. Not measured against real rpm.
     "idle_mute": 1.5,   # seconds of stillness before the driver is muted
 }
 RPM_LO, RPM_HI = 241.0, 431.0
@@ -344,7 +345,9 @@ def rpm_duty(rpm):
         return SPIN_STOP_DUTY
     f = (rpm - RPM_LO) / (RPM_HI - RPM_LO)
     d = TEX["spin_lo"] + f * (TEX["spin_hi"] - TEX["spin_lo"])
-    return min(max(d, 0.55), 0.92)
+    # Capped under the 0.66 where the bench spindle got loud, so a 2x profile's high rpm
+    # (PSX, Saturn) cannot push past it.
+    return min(max(d, 0.52), 0.62)
 
 
 def cmd_spin(args):
