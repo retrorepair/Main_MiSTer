@@ -76,7 +76,7 @@ TEX = {
     "grit": 0.06,       # random duty noise
     "bias": 0.0,        # added to every textured duty
     "eff": 1.0,         # scales the textured speed the firmware believes (bench tuning)
-    "min": 0.10,        # moves shorter than this fraction of the stroke are skipped
+    "min": 0.02,        # moves shorter than this fraction of the stroke are skipped
     "snap": 0.08,       # targets below this snap to the switch
     "spin_lo": 0.64,    # spindle duty at 241 rpm (rim)
     "spin_hi": 0.76,    # spindle duty at 431 rpm (hub)

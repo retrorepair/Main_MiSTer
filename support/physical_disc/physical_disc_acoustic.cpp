@@ -17,6 +17,7 @@
 #include "physical_disc_acoustic.h"
 #include "acoustic_model.h"
 #include "cd_geometry.h"
+#include "physical_disc_rig.h"
 
 // Replays the gestures acoustic_model produces on a spare disc in the USB
 // drive. The model says what the original mechanism would be doing; this file
@@ -721,6 +722,17 @@ static int own_device(void)
 static int mirror_aborted(void)
 {
 	return !mir.on || mir.held || mir.phys_session || mir.dev_fd < 0;
+}
+
+// The rig has no SCSI device to lose, so "should I stop" is only the switches.
+static int rig_aborted(void)
+{
+	return !mir.on || mir.held || mir.phys_session;
+}
+
+static void rig_trace(const char *line)
+{
+	acu_log("%s", line);
 }
 
 // Follow the original drive's CLV speed, changing it as the gesture asks.
@@ -1732,6 +1744,7 @@ static void *worker_main(void *arg)
 
 		if (!mir.on || mir.held || mir.disabled_perm || mir.phys_session) {
 			mirror_release();
+			rig_disconnect(1);
 			// Throw away anything the cores queued while we were parked, so
 			// we do not wake up and replay a minute of stale activity.
 			mir.ring_head = mir.ring_tail;
@@ -1851,7 +1864,8 @@ static void *worker_main(void *arg)
 		// collapsed away, so hanging the speed off them meant one ramp in
 		// seventy seconds on a PlayStation, which alternates 1x audio and 2x
 		// data constantly. apply_speed() is a no-op when nothing has changed.
-		apply_speed(model.stream_mult);
+		const int use_rig = cfg.physical_disc_acoustic_rig;
+		if (!use_rig) apply_speed(model.stream_mult);
 
 		// Collapse position updates, but never collapse movement.
 		//
@@ -1946,14 +1960,24 @@ static void *worker_main(void *arg)
 		// Nothing to open the drive for unless there is real work.
 		if (g.kind == GEST_NONE) continue;
 
-		if (mir.dev_fd < 0) {
+		if (use_rig) {
+			// The servo rig: no disc to find, just a board to answer on a serial port. It is
+			// real time -- gestures are played at the pace the original drive made them.
+			if (!rig_connected()) {
+				if (now - open_attempt_at < 1000.0) { sleep_ms(100); continue; }
+				open_attempt_at = now;
+				if (rig_connect()) { sleep_ms(100); continue; }
+			}
+		}
+		else if (mir.dev_fd < 0) {
 			if (now - open_attempt_at < 1000.0) { sleep_ms(100); continue; }
 			open_attempt_at = now;
 			if (mirror_acquire()) { sleep_ms(100); continue; }
 		}
 
 		double g_t0 = clock_ms();
-		play_gesture(&g);
+		if (use_rig) rig_play(&g, rig_aborted);
+		else         play_gesture(&g);
 		gesture_actual_ms = clock_ms() - g_t0;
 		if (g.kind != GEST_STREAM && g.kind != GEST_JUMP)
 			acu_log("  %-8s took %5.0fms, model wanted %5.0fms\n",
@@ -1999,7 +2023,11 @@ void physical_disc_acoustic_config(int enabled)
 			printf("physical_disc_acoustic: could not start thread\n");
 			return;
 		}
-		printf("physical_disc_acoustic: enabled - put a spare disc in the drive\n");
+		rig_set_log(rig_trace);
+		if (cfg.physical_disc_acoustic_rig)
+			printf("physical_disc_acoustic: enabled - plug in the servo rig\n");
+		else
+			printf("physical_disc_acoustic: enabled - put a spare disc in the drive\n");
 
 		// Synthesise the power-on sequence here, because the real one is always
 		// missed. A core mounts its disc inside user_io_init(), and this engine
