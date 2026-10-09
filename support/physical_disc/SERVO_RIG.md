@@ -174,3 +174,49 @@ worked"*, and the MegaSD reverse-engineering notes leave it as *"??seek time to 
 defined"*. The figures above come from the owner's ear on real hardware, and two
 independent observations of theirs are satisfied by the single constant 2400 ms,
 which is the best corroboration available.
+
+## MEASURED: the PS1 sled does a Mega CD sweep as one continuous move
+
+Bench result, PS1 KSM-440 mechanism, sled driven from an RP2040 through the board's own
+BA5977FP (IC722) at 25 kHz PWM. Time for a full stroke, outer stop to inner limit switch:
+
+| duty | full-stroke time | repeat runs | note |
+|------|------------------|-------------|------|
+| 0.14 | did not reach the switch in 8 s | 1 | below the stiction floor |
+| 0.16 | 5.04 s | 5.10, 4.98 | |
+| 0.18 | 3.30 s | 3.29, 3.30 | |
+| **0.20** | **2.37-2.43 s** | 2.373, 2.383, 2.431 | matches the ~2.4 s full stroke from the owner's ear |
+| **0.22** | **1.84 s** | 1.82, 1.865 | |
+| 0.25 | 1.37 s | 1.34, 1.41 | |
+| 0.30 | 0.95 s | | |
+| 0.35 | 0.78 s | | |
+| 0.40 | 0.68 s | | |
+| 0.50 | 0.51 s | | |
+| 0.60 | 0.42 s | | |
+| 0.75 | 0.33 s | | |
+| 1.00 | 0.25 s | | |
+
+**Repeatability is 1-5% run to run.** The USB drive's per-command cost swung 2-3x, which
+is what made velocity impossible to hold. A Mega CD full stroke of 1.6-2.4 s sits at duty
+0.20-0.25, so a seek is ONE continuous sweep with no segmentation and no start/stop
+impulses. The curve is steeply non-linear below 0.20 (stiction), so it is used as a lookup
+table with interpolation in log-time rather than a formula.
+
+Method: wind or hop the sled to the outer stop, drive inward at the duty under test until
+the limit switch closes, time it. The outward hop that finds the outer stop is a fixed
+1.3 s at duty 0.30 from the switch, which lands on the stop without grinding.
+
+### Channel map, from Sony's service manual schematic (not guessed)
+
+IC722 pins 17/18 (ch3) drive the SLED, via CN701 pins 2/1. Pins 15/16 (ch4) drive the
+SPINDLE, via CN701 pins 3/4. ch3 inputs are pin 23 (FIN) and pin 22 (RIN): a plain PWM
+pair. ch4 is the one analogue channel (pin 24 through the board's own 4.7k + 0.22uF).
+Pins 4-7 are ch1/ch2, the focus and tracking coils, which go to the laser flex.
+Normal idle voltages: MUTE(20) 3.3 V, SW(3) 0 V, PowVcc 7.4 V, OUTVref(26) 1.7 V.
+
+### Two bugs that cost most of a day, recorded so they are not repeated
+
+1. `_limit.value()` with brackets. In CircuitPython `.value` is a property. The call raised
+   "'bool' object is not callable" and silently killed code.py right after it created an
+   empty results.csv. A stubbed test that never called the function could not see it.
+2. "ch4 is the sled" was taken on trust. The schematic says ch4 is the spindle.
