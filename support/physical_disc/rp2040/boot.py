@@ -1,25 +1,20 @@
-# boot.py -- decide who owns the filesystem, based on how the Pico is powered.
+# boot.py -- runs once at power-up, before code.py.
 #
-# CircuitPython exposes CIRCUITPY as a USB drive, but the host and the running code
-# cannot both write to it. So:
-#
-#   powered WITHOUT a USB data host (from the PS1's 5 V, or a phone charger)
-#       -> the filesystem is writable by code, so a test run can log its result
-#
-#   plugged into a PC
-#       -> the filesystem belongs to the host, so the results file can be read off
-#
-# Which is exactly the intended workflow: run the tests on PS1 power, then plug into
-# the PC to collect them.
-#
-# CONSEQUENCE, and it is the one thing that will catch you out: do NOT run the tests
-# with the Pico plugged into the PC. It cannot write the result and code.py will say
-# so with a continuous fast blink.
+# 1. Enable a SECOND USB serial port. The first stays the REPL console, which is how
+#    the board is debugged; the second ("data") carries the servo protocol that
+#    servo_fw.py speaks, so the two never get mixed up.
+# 2. Let the running code write the filesystem (it saves the sled polarity in
+#    /dir.txt). Measured on the bench: supervisor.runtime.usb_connected reads False
+#    here even when the board is plugged into a PC, because USB has not enumerated
+#    yet, so this always makes the drive writable by the code and read-only to the PC.
+#    To copy files from a PC, either hold the board in the bootloader or write them
+#    through the REPL console (see HANDOFF.md).
 
 import storage
 import supervisor
+import usb_cdc
+
+usb_cdc.enable(console=True, data=True)
 
 if not supervisor.runtime.usb_connected:
-    # Standalone: let the test write its result.
     storage.remount("/", readonly=False)
-# Plugged into a host: leave it alone, so the drive is readable as normal.
