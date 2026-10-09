@@ -31,7 +31,9 @@ static const acu_drive_t drives[PD_ACU_PROFILE_COUNT] = {
 	// sweep is 1: every real deck in this table calibrates on a disc insert, so
 	// the fallback should too. At 0 the boot sweep was skipped whenever no core
 	// had yet claimed a profile, which is exactly when the boot happens.
-	{ "auto",      2.0, 1.0,  32,  640,   30,   160,  1200,  1500, 8000,  8, 1,   4 },
+	// The generic row plays before a core has said which console it is, so it must not invent a
+	// stroke sweep either: home first, like every drive whose start-up is documented here.
+	{ "auto",      2.0, 1.0,  32,  640,   30,   160,  1200,  1500, 8000,  8, 2,   4 },
 	// PlayStation: Sony KSM-440, 2x data / 1x audio. Fast, chattery sled.
 	// base 100 ms, stroke 900 ms and spin-up 1000 ms are DuckStation's figures
 	// (src/core/cdrom.cpp): a medium seek costs 0.05-0.1 s, a sled seek
