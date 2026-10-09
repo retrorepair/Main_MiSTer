@@ -5,7 +5,9 @@ pyserial, when the Pico is plugged into it instead of the PC. Standard library o
     picotool.py find
     picotool.py send  <data-port> "TEX spin_lo 0.55" "SPIN 241 300" [--wait 0.3]
     picotool.py steps <data-port> 0.53,0.55,0.57 [--on 4] [--off 2]
+    picotool.py script <data-port> "SPIN 241 300" @sleep=1 "DRIVE out 0.11 1000" @done "HOME 0.5" @done
     picotool.py deploy <console-port> <file> [--dest /code.py]
+    picotool.py grain <data-port> "A:grit=0.06;B:grit=0.12,carrier=300" [--pause 2.5]
 
 CircuitPython exposes two ports. The console (REPL) is the lower /dev/ttyACM number and the data
 port (the protocol in servo_fw.py) the higher; `find` tells them apart by PING. Do not run this
@@ -85,6 +87,86 @@ def cmd_steps(args):
     os.close(fd)
 
 
+def wait_done(fd, timeout):
+    """Collect lines until a DONE line arrives; return it (or '' on timeout)."""
+    end = time.time() + timeout
+    buf = ""
+    while time.time() < end:
+        buf += read_for(fd, 0.05)
+        for l in buf.splitlines():
+            if l.startswith("DONE"):
+                return l
+    return ""
+
+
+def done_ms(line):
+    p = line.split()
+    return int(p[3]) if len(p) >= 5 else -1
+
+
+def cmd_grain(args):
+    """Play the Mega CD data->CDDA seek and its return once per texture variant, so they can be
+    compared by ear, and report how far the sled really travelled (smooth HOME as the ruler: 472 ms is
+    a whole stroke) and how long the return took. Variants are NAME:key=value,key=value separated by ;"""
+    base = {"carrier": 300, "swell": 4.9, "amp": 0.03, "grit": 0.12, "bias": 0.0}   # servo_fw.py defaults
+    fd = open_raw(args.port)
+
+    def tx(line, wait=0.12):
+        os.write(fd, (line + "\n").encode())
+        return read_for(fd, wait)
+
+    def run(line, timeout):
+        os.write(fd, (line + "\n").encode())
+        return wait_done(fd, timeout)
+
+    for i, v in enumerate(args.variants.split(";"), 1):
+        name, _, kv = v.partition(":")
+        t = dict(base)
+        for pair in filter(None, kv.split(",")):
+            k, _, val = pair.partition("=")
+            t[k] = float(val)
+        for k, val in t.items():
+            tx("TEX %s %s" % (k, val), 0.05)
+        print("variant %d (%s): %s" % (i, name, ", ".join("%s=%s" % kv for kv in sorted(t.items()))), flush=True)
+        tx("SPIN 431 300", 0.3)
+        run("HOME 0.5", 9)
+        tx("MOVE 700 1971", 0.1); tx("SPIN 241 1971", 0.05)
+        out = wait_done(fd, 5)
+        time.sleep(0.4)
+        ruler = run("HOME 0.5", 9)
+        x = done_ms(ruler) / 472.0
+        time.sleep(0.8)
+        tx("SPIN 431 300", 0.05)
+        tx("MOVE 700 1971", 0.1); tx("SPIN 241 1971", 0.05)
+        wait_done(fd, 5)
+        time.sleep(0.4)
+        tx("MOVE 30 1923", 0.1); tx("SPIN 431 1923", 0.05)
+        back = wait_done(fd, 6)
+        print("   out %s | true travel %.2f of the stroke (asked 0.70) | back %s ms (asked 1923)"
+              % (out.split()[-1] if out else "?", x, done_ms(back)), flush=True)
+        time.sleep(args.pause)
+    for k, val in base.items():
+        tx("TEX %s %s" % (k, val), 0.05)
+    tx("SPIN 0 300", 0.4)
+    tx("STOP")
+    os.close(fd)
+
+
+def cmd_script(args):
+    """Run a list of steps. A plain step is a protocol line (its reply is printed); @sleep=S waits;
+    @done waits for the next DONE line and prints it."""
+    fd = open_raw(args.port)
+    for st in args.steps:
+        if st.startswith("@sleep="):
+            time.sleep(float(st[7:]))
+        elif st == "@done":
+            print("   %s" % (wait_done(fd, 12) or "(no DONE)"), flush=True)
+        else:
+            os.write(fd, (st + "\n").encode())
+            print("%-24s -> %s" % (st, read_for(fd, 0.15).strip().replace("\n", " | ")), flush=True)
+    os.close(fd)
+
+
 def cmd_deploy(args):
     data = open(args.file, "rb").read()
     b64 = base64.b64encode(data).decode()
@@ -128,6 +210,10 @@ def main():
     p = sub.add_parser("steps"); p.add_argument("port"); p.add_argument("duties")
     p.add_argument("--on", type=float, default=4.0); p.add_argument("--off", type=float, default=2.5)
     p.set_defaults(f=cmd_steps)
+    p = sub.add_parser("grain"); p.add_argument("port"); p.add_argument("variants")
+    p.add_argument("--pause", type=float, default=2.5); p.set_defaults(f=cmd_grain)
+    p = sub.add_parser("script"); p.add_argument("port"); p.add_argument("steps", nargs="+")
+    p.set_defaults(f=cmd_script)
     p = sub.add_parser("deploy"); p.add_argument("port"); p.add_argument("file")
     p.add_argument("--dest", default="/code.py"); p.set_defaults(f=cmd_deploy)
     a = ap.parse_args()

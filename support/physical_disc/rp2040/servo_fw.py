@@ -70,12 +70,15 @@ TEX_CURVE = ((0.02, 0.01), (0.04, 0.065), (0.06, 0.138), (0.08, 0.243), (0.10, 0
 
 # Tunables, changed with TEX. The defaults are the sound the owner picked by ear (P).
 TEX = {
-    "carrier": 440.0,   # Hz of the grind; below ~1 kHz it is audible and rough
+    "carrier": 300.0,   # Hz of the grind; below ~1 kHz it is audible and rough
     "swell": 4.9,       # loud/quiet cycles per second
     "amp": 0.03,        # swell depth, in duty
-    "grit": 0.06,       # random duty noise
+    "grit": 0.12,       # random duty noise
     "bias": 0.0,        # added to every textured duty
-    "eff": 1.0,         # scales the textured speed the firmware believes (bench tuning)
+    "eff": 1.04,        # scales the textured speed the firmware believes. From six repeats of
+                        # MOVE 700 1971 with this texture: 0.73 of the stroke travelled, 0.70 asked.
+    "eff_in": 1.14,     # the same, extra, for INWARD moves: the sled comes home about 19% faster
+                        # than the table (1.68 s against 1.92 s asked, +-5% run to run)
     "min": 0.02,        # moves shorter than this fraction of the stroke are skipped
     "snap": 0.08,       # targets below this snap to the switch
     "spin_lo": 0.57,    # spindle duty at 241 rpm (rim). By ear on the bench: steps 0.53-0.62
@@ -290,7 +293,7 @@ def cmd_home(args):
         start_move("home", False, -1.0, d, 8.0, True, 9.0)
     else:
         v = 0.5
-        start_move("home", False, -1.0, duty_for(v / TEX["eff"]), 2.0, False, 9.0)
+        start_move("home", False, -1.0, duty_for(v / (TEX["eff"] * TEX["eff_in"])), 2.0, False, 9.0)
     say("OK")
 
 
@@ -316,7 +319,7 @@ def cmd_move(args):
     wake()
     outward = target > pos
     v = dist / T
-    d = duty_for(v / TEX["eff"])
+    d = duty_for(v / (TEX["eff"] * (1.0 if outward else TEX["eff_in"])))
     limit_s = T + (3.0 if target == 0.0 else 0.4)
     start_move("move", outward, target, d, T, False, limit_s)
     say("OK %d %d" % (int(pos * 1000), int(target * 1000)))
@@ -461,7 +464,7 @@ def step():
         if m.plain:
             v = speed_at(d)
         else:
-            v = speed_tex(m.d + TEX["bias"]) * TEX["eff"]
+            v = speed_tex(m.d + TEX["bias"]) * TEX["eff"] * (1.0 if m.outward else TEX["eff_in"])
         pos += (v * dt) if m.outward else -(v * dt)
         if pos < 0.0:
             pos = 0.0
