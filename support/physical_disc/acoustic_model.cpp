@@ -86,9 +86,17 @@ static const acu_drive_t drives[PD_ACU_PROFILE_COUNT] = {
 	// this model has no direction term. The 80 ms startup is also partly
 	// rotational, which rot_ms counts again, so the fixed cost is if anything
 	// slightly generous.)
-	{ "Saturn",    2.0, 1.0,  32,  360,   30,    87,   620,  1200, 0,     8, 1,   3 },
+	// calib_sweep 2: the Saturn service manual (PAL, 1995) p.8 says that on power-up with the
+	// door switch on "the laser emits light for approx. 3 seconds and the pickup lens moves up and
+	// down", and lists a "P. SW board" (a pickup switch, the Mega CD's SW501 equivalent). That is a
+	// home-then-focus start-up, not a sweep. The drive electronics are not in that manual, so this is
+	// inferred, not read off a flowchart.
+	{ "Saturn",    2.0, 1.0,  32,  360,   30,    87,   620,  1200, 0,     8, 2,   3 },
 	// PC Engine CD: 1x, seek curve measured by Dave Shadoff.
-	{ "PCECD",     1.0, 1.0,  24,  644,   50,   283,  2300,  2000, 7000,  4, 1,   5 },
+	// calib_sweep 2: the CDR-30/CDR-30A is built from the same Sony family as the Mega CD 2 (CXD1167
+	// or CXD1135 DSP, CXA1081/CXA1082 servo amps; github.com/rgalland/PC-Engine_CDR-30A_Schematics),
+	// so it homes the sled, finds focus, then spins up.
+	{ "PCECD",     1.0, 1.0,  24,  644,   50,   283,  2300,  2000, 7000,  4, 2,   5 },
 	// 3DO: 2x on the FZ-10, slow to settle.
 	{ "3DO",       2.0, 1.0,  32,  640,   40,   160,  1000,  2000, 0,     8, 1,   4 },
 	// CD-i: 1x, a deliberately quiet consumer deck.
