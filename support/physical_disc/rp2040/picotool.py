@@ -172,11 +172,14 @@ def cmd_repl(args):
     """Interrupt code.py and run lines at the REPL (one per call to read, --gap apart); prints the
     echo. Use for bypassing servo_fw.py entirely. Leaves the REPL at the prompt: finish with a line
     like "import microcontroller; microcontroller.reset()" to restart code.py."""
+    lines = list(args.lines)
+    if args.file:
+        lines += [l.rstrip("\n") for l in open(args.file) if not l.startswith("##")]
     fd = open_raw(args.port)
     os.write(fd, b"\x03"); read_for(fd, 0.5)
     os.write(fd, b"\x03"); read_for(fd, 0.7)
     os.write(fd, b"\r"); read_for(fd, 0.4)
-    for ln in args.lines:
+    for ln in lines:
         os.write(fd, (ln + "\r").encode())
         out = read_for(fd, args.gap)
         print(out.replace("\r", "").rstrip())
@@ -231,8 +234,9 @@ def main():
     p.add_argument("--pause", type=float, default=2.5); p.set_defaults(f=cmd_grain)
     p = sub.add_parser("script"); p.add_argument("port"); p.add_argument("steps", nargs="+")
     p.set_defaults(f=cmd_script)
-    p = sub.add_parser("repl"); p.add_argument("port"); p.add_argument("lines", nargs="+")
-    p.add_argument("--gap", type=float, default=0.15); p.set_defaults(f=cmd_repl)
+    p = sub.add_parser("repl"); p.add_argument("port"); p.add_argument("lines", nargs="*")
+    p.add_argument("--gap", type=float, default=0.15); p.add_argument("--file", help="read the lines from this file")
+    p.set_defaults(f=cmd_repl)
     p = sub.add_parser("deploy"); p.add_argument("port"); p.add_argument("file")
     p.add_argument("--dest", default="/code.py"); p.set_defaults(f=cmd_deploy)
     a = ap.parse_args()

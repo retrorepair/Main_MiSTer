@@ -332,8 +332,26 @@ and the board can switch it on by itself, so those two flex conductors must be i
 driver Q701 removed. The laser is infrared and invisible.
 
 Firmware: `LENS <F|T|B> <N|D|R> <amp> <ms> [carrier]` (noise, steady level, ramp), `LENS OFF`. `amp` is a
-fraction of `TEX lens_max` (default 0.15 of the 7.4 V supply), so no command can exceed that cap; raise it only
-after watching the lens on a scope.
+fraction of `TEX lens_max` (duty, i.e. 5 V x duty across the coil per the datasheet), so no command can exceed
+that cap, and a governor holds sustained drive to `lens_rms`.
+
+### BA5977FP, from the Rohm datasheet (C:\t\BA5977FP.PDF, Japanese; read in full)
+
+Channels 1-3 take a PWM pair (F, R). Inputs steer constant currents I1 = I2 = 25 uA (typ) into R1 = 100 kOhm
+and C1 = 25 pF, a node of +-2.5 V about Vref and a time constant of 2.5 us (corner about 64 kHz), then
+BTL buffers drive the load. So:
+
+* Output across the load is linear in duty: **volts = 5 V x (duty_F - duty_R)**. The datasheet's maximum
+  output amplitude is 5.0 V typ (4.4-5.6 V) into 8 Ohm at 8 V supply. That is the most a PS1 can ever put
+  on a lens coil or sled motor, which is why asking for "7 V" (the Mega CD 2 manual's figure for a
+  different driver on 9 V) cannot work here.
+* The filter does not limit audio: 1 kHz and 7.8 kHz drives reach the load at full amplitude.
+* Truth table: F=H R=L forward; F=L R=H reverse; L,L and H,H both zero output.
+* Input levels: H >= 2.4 V, L <= 0.5 V. Mute (pin 20) at <= 0.5 V. Thermal shutdown about 180 C. Output
+  offset within +-30 mV. Fig. 9 shows the duty-to-volts line was measured at 88.2 kHz.
+* Application example (Fig. 6): pins 13/14 (channel 1) go to the TRACKING coil and pins 11/12 (channel 2)
+  to the FOCUS coil, the opposite of what the line nesting on the PSone schematic suggested. Not yet
+  settled for this board; the first test that moves the lens should say which axis each channel is.
 
 ### Still open
 

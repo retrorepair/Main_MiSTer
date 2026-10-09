@@ -10,9 +10,9 @@
 #   MOVE <permille> <ms>    -> OK <from> <to>, then DONE MOVE <pos> <ms> <reason>
 #                              (reason: target, home, limit, time, or stuck = never left the hub)
 #   DRIVE <out|in> <duty> <ms> -> OK, then DONE MOVE ...   (bench diagnostic, fixed duty)
-#   LENS <F|T|B> <N|D|R> <amp> <ms> [carrier] -> OK, then DONE LENS <ms>
+#   LENS <F|T|B> <N|D|R|S> <amp> <ms> [carrier] -> OK, then DONE LENS <ms>
 #                           drives the pickup's lens coils through IC722 ch1 (F, focus) and ch2
-#                           (T, tracking): N noise, D steady level, R ramp. amp is 0..1 of the
+#                           (T, tracking): N noise, D steady level, R ramp -amp..amp, S saw 0..amp. amp is 0..1 of the
 #                           lens_max cap, so nothing here can exceed it. LENS OFF stops.
 #   SPIN <rpm> <ms>         -> OK         (0 rpm parks the spindle)
 #   TEX <name> <value>      -> OK         (texture/tuning parameters, see TEX below)
@@ -83,8 +83,14 @@ TEX = {
     "amp": 0.03,        # swell depth, in duty
     "grit": 0.12,       # random duty noise
     "bias": 0.0,        # added to every textured duty
-    "lens_max": 0.15,   # the most the lens drive may ever reach, as a duty (x7.4 V BTL): the coil is
-                        # fragile, so this stays low until it has been tuned by ear and by scope
+    "lens_max": 0.95,   # the peak the lens drive may reach, as a duty: the BA5977FP gives 5 V x duty across
+                        # the coil (datasheet p.8, max 5.0 V typ), so this is 4.75 V, the most it can do. The
+                        # Mega CD 2 service manual p.12-13 puts the real focus-search drive across the
+                        # coil at about 7 V, a focus-on burst at about 4 Vp-p. The first caps (0.15, then
+                        # 0.60) were both "way too weak" on the bench.
+    "lens_rms": 0.55,   # but the coil is thin wire, so the drive is also held to this RMS duty
+    "lens_tau": 1.0,    # (4 V: what a full 0-7 V search ramp averages) over this many seconds: short
+                        # strong pulses pass, a long steady push is scaled back
     "lens_carrier": 8000.0,  # PWM carrier of the noise drive: audible, so it is part of the sound
     "kick_min": 0.30,   # the textured drive's mean duty is tiny, so its kick and brake use at least this
     "kick_ms": 12.0,    # smooth moves start with a kick: the datasheet's sled kick (CXD2545Q p.30) is
@@ -263,14 +269,17 @@ def lens_level(k, x):
 
 
 def lens_off():
-    global lens_job
+    global lens_job, lens_t_end
     lens_job = None
+    lens_t_end = time.monotonic_ns()
     for k in lens:
         lens[k][0].duty_cycle = 0
         lens[k][1].duty_cycle = 0
 
 
 lens_job = None
+lens_ms2 = {"F": 0.0, "T": 0.0}      # running mean-square of the demanded lens duty
+lens_t_end = time.monotonic_ns()
 
 
 def coast():
@@ -426,7 +435,7 @@ def cmd_lens(args):
     mode = args[1].upper()
     amp = float(args[2])
     T = max(float(args[3]), 20.0) / 1000.0
-    if mode not in ("N", "D", "R"):
+    if mode not in ("N", "D", "R", "S"):
         say("ERR mode")
         return
     for k in chs:
@@ -440,6 +449,10 @@ def cmd_lens(args):
     j = Mv()
     j.chs, j.mode, j.amp, j.T = chs, mode, amp, T
     j.t0 = time.monotonic_ns()
+    j.last = j.t0
+    idle = (j.t0 - lens_t_end) * 1e-9
+    for k in lens_ms2:
+        lens_ms2[k] *= math.exp(-idle / TEX["lens_tau"])
     lens_job = j
     say("OK")
 
@@ -624,13 +637,28 @@ def step():
             lens_off()
             say("DONE LENS %d" % int(lj.T * 1000))
         else:
+            ldt = (ns - lj.last) * 1e-9
+            lj.last = ns
+            a = ldt / TEX["lens_tau"]
+            if a > 1.0:
+                a = 1.0
             for k in lj.chs:
                 if lj.mode == "N":
                     x = lj.amp * (random.random() * 2.0 - 1.0)
                 elif lj.mode == "D":
                     x = lj.amp
+                elif lj.mode == "S":
+                    x = lj.amp * (el / lj.T)             # one-sided saw, 0 up to amp: a focus search
                 else:
                     x = lj.amp * (2.0 * el / lj.T - 1.0)
+                # Thermal governor: track the RMS duty being asked for and scale the drive back
+                # when it exceeds lens_rms, so a long push cannot cook the coil.
+                dd = min(abs(x), 1.0) * TEX["lens_max"]
+                ms = lens_ms2[k] + (dd * dd - lens_ms2[k]) * a
+                lens_ms2[k] = ms
+                rms = math.sqrt(ms)
+                if rms > TEX["lens_rms"]:
+                    x *= TEX["lens_rms"] / rms
                 lens_level(k, x)
 
     r = spin_ramp

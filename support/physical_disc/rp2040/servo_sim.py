@@ -25,6 +25,7 @@ class World:
     spin = 0.515
     log_pos = []
     lens_max = 0.0            # the highest lens duty ever seen
+    lens_now = {}             # the duty last written to each lens pin
     jam = False               # the carriage will not leave the hub
 
 W = World()
@@ -68,7 +69,9 @@ class PWM:
         if self.pin == "GP4": W.duty["fin"] = f
         if self.pin == "GP5": W.duty["rin"] = f
         if self.pin == "GP2": W.spin = f
-        if self.pin in ("GP10", "GP11", "GP12", "GP13"): W.lens_max = max(W.lens_max, f)
+        if self.pin in ("GP10", "GP11", "GP12", "GP13"):
+            W.lens_max = max(W.lens_max, f)
+            W.lens_now[self.pin] = f
     def deinit(self): self.alive = False
 
 class Serial:
@@ -229,6 +232,19 @@ W.lens_max = 0.0
 send("LENS F D 9 200", 0.05); advance(0.4); W.tx = b""
 check("an oversize amplitude is clamped to the cap", 0.0 < W.lens_max <= ns["TEX"]["lens_max"] + 0.001, "%.3f" % W.lens_max)
 check("a bad channel is rejected", send("LENS Q N 1 100")[0].startswith("ERR"))
+# A long steady push is scaled back to the RMS limit, short pulses are not.
+W.lens_max = 0.0
+send("LENS F D 1 150", 0.05); advance(0.3); W.tx = b""
+short_peak = W.lens_max
+W.lens_max = 0.0
+last = {"d": 0.0}
+send("LENS F D 1 4000", 0.05)
+advance(3.5)
+tail = W.lens_max
+check("a short full push reaches the peak cap", short_peak > 0.55, "%.3f" % short_peak)
+now = max(W.lens_now.values())
+check("a 4 s steady push is held to the RMS limit by the end", now <= ns["TEX"]["lens_rms"] + 0.03, "drive at the end %.3f, rms limit %.2f" % (now, ns["TEX"]["lens_rms"]))
+send("LENS OFF"); W.tx = b""
 
 send("STOP")
 check("STOP mutes and parks", W.muted_driver and abs(W.spin - 0.515) < 0.01)
