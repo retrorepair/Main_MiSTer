@@ -377,7 +377,7 @@ ctypes, the analysis scripts run in WSL with numpy). A microphone beside the rig
 * The 1 kHz tone: the recording's line is +12 to +17 dB over its surroundings with no harmonics. The rig's
   triangle at peak 0.5 gives +14 dB at 1 kHz but its third harmonic (3 kHz) reads +23 to +27 dB, because the
   pickup radiates 3 kHz far better than 1 kHz. A sine ("s", `BEEP_SHAPE` in the translator) brings 3 kHz down to
-  about equal to 1 kHz. The triangle is the default because the owner asked for "more triangle than square".
+  about equal to 1 kHz. The owner confirmed on 2026-10-10 that a sine is what they meant, so "s" is the default.
 
 ### Open wires found by probing from the Pico (2026-10-10)
 

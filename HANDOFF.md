@@ -415,7 +415,7 @@ left is the end-to-end listen with the Pico on the MiSTer's USB.
   deploy in `picotool.py` (the old REPL upload dropped characters and then ran out of RAM at 31 KB).
 * Translator: per-console `lens_policy`; boot lens sequence once per disc; keepalive PING every 2 s while idle.
 * All of it is in `SERVO_RIG.md` ("The lens orchestra", "Open wires"). Deployed: Pico firmware CRC 0xf746a0e7,
-  MiSTer binary md5 4f90c214..., both on the MiSTer; core left at the menu.
+  MiSTer binary md5 879731855c65..., both on the MiSTer; core left at the menu.
 * **The sled and spindle do not move because GP4 and GP2 are not connected** (probe results in SERVO_RIG.md). Fix
   the joints first, then re-run `rec.py` + `pattern.py` + `pattern_analysis.py`: with the spindle on versus off
   there must be a measurable difference, and the 1-4 kHz body of the real console's sound has to come from those

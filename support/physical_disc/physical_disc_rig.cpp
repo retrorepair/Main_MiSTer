@@ -104,7 +104,7 @@ static void nap_ms(double ms)
 // real PlayStation reading is 9-12 dB above its idle floor at 4-8 kHz (the recording), and level 2 at
 // 8 kHz gives 12 dB there on the rig, so that is what the steady noise uses.
 #define NOISE_HZ  8000
-#define BEEP_SHAPE "t"      // "t" triangle (as asked), "s" sine (measured closer to the recording)
+#define BEEP_SHAPE "s"      // "s" sine: what the owner meant (the datasheet says sine, the recording is a pure tone); "t" triangle
 struct lens_policy {
 	int focus_ms;      // boot: focus-search ramp after the sled homes (0 = none)
 	int beep;          // boot: the CXD2545Q auto-gain tone after focus is found
@@ -379,12 +379,10 @@ static int lens_boot(int (*aborted)(void))
 	}
 	if (p->beep) {
 		// CXD2545Q AGCNTL: a 1 kHz sine into the loop. The recording has it at 1004 Hz for 0.4 s. A square
-		// pulse train sounded far too sharp on the rig, so it is a triangle ("t") at the owner's word:
-		// peak 0.5 of the 5 V swing. MEASURED with a microphone beside the rig: the 1 kHz line is +14 dB
-		// over its surroundings at 0.5, like the recording's +15, but the pickup radiates a 3 kHz harmonic
-		// far better than 1 kHz, so the triangle's third harmonic reads +10 dB ABOVE the fundamental; a
-		// sine ("s") brings that down to about equal. The recording is a pure tone, so "s" matches it
-		// better; BEEP_SHAPE is the one word to change if the owner agrees.
+		// pulse train sounded far too sharp on the rig; the owner meant a sine (peak 0.5 of the 5 V swing).
+		// MEASURED with a microphone beside the rig: the 1 kHz line is +14 dB over its surroundings at 0.5,
+		// like the recording's +15, but the pickup radiates a 3 kHz harmonic far better than 1 kHz, so a
+		// triangle's third harmonic read +10 dB ABOVE the fundamental and a sine's about equal to it.
 		char tone[48];
 		snprintf(tone, sizeof(tone), "LENS F G 0.5 400 1000 %s", BEEP_SHAPE);
 		cmd(tone, REPLY_MS);
