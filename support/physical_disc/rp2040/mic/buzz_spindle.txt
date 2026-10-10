@@ -1,0 +1,16 @@
+import board, digitalio, pwmio, time, microcontroller
+sw = digitalio.DigitalInOut(board.GP8); sw.direction = digitalio.Direction.OUTPUT; sw.value = False
+mute = digitalio.DigitalInOut(board.GP7); mute.direction = digitalio.Direction.OUTPUT; mute.value = True
+time.sleep(1.0)
+print("BUZZ marker")
+m1 = pwmio.PWMOut(board.GP10, frequency=8000, duty_cycle=int(0.8*65535)); time.sleep(0.4); m1.deinit()
+time.sleep(1.0)
+print("BUZZ SPINDLE GP2 300Hz 0.5 for 3 s")
+s = pwmio.PWMOut(board.GP2, frequency=300, duty_cycle=int(0.5*65535)); time.sleep(3.0); s.duty_cycle = int(0.515*65535); s.deinit()
+time.sleep(2.0)
+print("BUZZ SPINDLE GP2 100Hz 0.5 for 3 s")
+s = pwmio.PWMOut(board.GP2, frequency=100, duty_cycle=int(0.5*65535)); time.sleep(3.0); s.duty_cycle = int(0.515*65535); s.deinit()
+time.sleep(2.0)
+print("BUZZ done")
+mute.value = False
+microcontroller.reset()

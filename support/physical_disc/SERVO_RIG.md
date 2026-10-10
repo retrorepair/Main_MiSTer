@@ -379,7 +379,26 @@ ctypes, the analysis scripts run in WSL with numpy). A microphone beside the rig
   pickup radiates 3 kHz far better than 1 kHz. A sine ("s", `BEEP_SHAPE` in the translator) brings 3 kHz down to
   about equal to 1 kHz. The owner confirmed on 2026-10-10 that a sine is what they meant, so "s" is the default.
 
-### Open wires found by probing from the Pico (2026-10-10)
+### Sled outward and spindle: no signal reaches the chip (2026-10-10, microphone-confirmed)
+
+**Corrected after the first write-up.** The pin probes below only show that GP4 and GP2 see no low-impedance
+load, which a wire open at either end gives, but they cannot say where. The decisive test is acoustic: a raw
+300 Hz PWM (50%) from the REPL on each line while the PC microphone records (`mic/buzz_sled.txt`,
+`mic/buzz_spindle.txt`, `mic/buzz_analysis.py`):
+
+* **RIN (GP5, IC722 pin 22): the sled motor buzzes**, 300/900/1200/1500 Hz lines at +20 to +31 dB over their
+  surroundings. So the chip's motor power stage, the mute, the motor connector and the motor are all alive.
+* **FIN (GP4, pin 23): nothing at all.** The outward half of the sled drive is not reaching, or not driving,
+  the chip. Everything the sled does outward (and the earlier "stuck at the hub") follows from this.
+* **Spindle (GP2 through its filter to pin 24), 300 Hz and 100 Hz: nothing.**
+* The chip's ch1-3 inputs draw 170-450 uA when high (datasheet, about 16 kOhm to ground), which is why a
+  connected input discharges at once; GP4 does not, so nothing with that load is on its net. The datasheet's SW
+  pin (3) only switches the spindle's filter capacitor, so it cannot be the cause.
+* The quick check that settles where it breaks: continuity from the Pico GP4 pin to IC722 pin 23 (and GP2 to the
+  filter and on to pin 24). A jumper that is broken inside its insulation looks perfect.
+
+### Pin probes (2026-10-10)
+
 
 Sled and spindle did not move at all, with the old and the new firmware and with raw PWM from the REPL; the lens
 channels worked at the same time (so the chip is powered and unmuted). Probing the Pico's own pins
