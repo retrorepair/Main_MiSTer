@@ -397,6 +397,13 @@ load, which a wire open at either end gives, but they cannot say where. The deci
 * The quick check that settles where it breaks: continuity from the Pico GP4 pin to IC722 pin 23 (and GP2 to the
   filter and on to pin 24). A jumper that is broken inside its insulation looks perfect.
 
+**Resolved (2026-10-10).** The wires for GP2 and GP4 had been re-made swapped (GP2 on the sled's FIN, GP4 on the
+spindle input). A firmware remap does NOT work: GP4 and GP5 share PWM slice 2, and the sled's drive needs 300 Hz
+(textured) on GP5 while the spindle needs a fixed 25 kHz on GP4 (`RuntimeError: Conflicting settings for shared
+resource`). So the wiring has to be as in "Wiring": **sled FIN GP4, sled RIN GP5 (same slice, same carrier), spindle
+GP2 alone.** Verified after swapping them back: probes show GP4 and GP5 as chip inputs and GP2 high-impedance, and
+`HOME` / `MOVE 700` / `MOVE 0` run with the limit switch opening and closing as expected.
+
 ### Pin probes (2026-10-10)
 
 
