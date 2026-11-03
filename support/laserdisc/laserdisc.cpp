@@ -7,10 +7,11 @@
 //
 // Mailbox (core/rtl/ld_stream.sv):
 //   0x30000000  header block, written here: "LDH1", version 1, disc generation, frame count, words per frame,
-//               field1_row, crop_x, crop_y, audio offset, PPS, slot table (16 x u32, all ones = empty)
+//               field1_row, crop_x, crop_y, audio offset, VBI offset, PPS, slot table (16 x u32, all ones = empty)
 //   0x30000400  status block, written by the core at every frame boundary: "LDS1", boundary count, wanted
 //               frame, player state, generation, frame being decoded, frame on screen, counters
-//   0x30100000  16 slots of 1 MB
+//   0x30100000  16 slots of 1 MB: the frame's picture and audio as stored in the stream, then its 16-byte VBI
+//               table entry (lines 16, 17, 329, 330), which the core's player reads like the disc's VBI
 
 #include <fcntl.h>
 #include <pthread.h>
@@ -40,7 +41,11 @@
 struct dscv
 {
 	int fd;
-	uint32_t count, frame_bytes, stride, load_bytes, audio_off;
+	uint32_t count, frame_bytes, stride, load_bytes, audio_off, vbi_slot_off;   // the stream in use
+	uint64_t dsc_frames_off, cvb_frames_off;
+	uint32_t dsc_frame_bytes, dsc_stride, dsc_audio_off, cvb_frame_bytes, cvb_stride, cvb_audio_off;
+	int has_cvbs, cvbs;              // a composite region exists (tools/convert/dscv/add_cvbs.py); it is in use
+	uint8_t *vbi;                    // the stream's VBI table, 16 bytes per frame (NULL: none)
 	uint64_t frames_off;
 	uint16_t width, height, field1_row, crop_x, crop_y;
 	uint8_t pps[128];
@@ -108,11 +113,49 @@ static void load(int k, uint32_t f)
 	}
 	posix_fadvise(disc.fd, (off_t)off, (off_t)disc.load_bytes, POSIX_FADV_DONTNEED);
 	memcpy(mem + RING + (size_t)k * SLOT_SIZE, stage, n);
+	if (disc.vbi) memcpy(mem + RING + (size_t)k * SLOT_SIZE + disc.vbi_slot_off, disc.vbi + (size_t)f * 16, 16);
 	__sync_synchronize();
 	wr32(TABLE + 4 * k, f);
 	__sync_synchronize();
 	slot_f[k] = f;
 	loads++;
+}
+
+// Make one of the stream's two regions the one in use: the DSC picture or the composite samples.
+static void select_stream(int cvbs)
+{
+	disc.cvbs = cvbs;
+	disc.frames_off = cvbs ? disc.cvb_frames_off : disc.dsc_frames_off;
+	disc.frame_bytes = cvbs ? disc.cvb_frame_bytes : disc.dsc_frame_bytes;
+	disc.stride = cvbs ? disc.cvb_stride : disc.dsc_stride;
+	disc.audio_off = cvbs ? disc.cvb_audio_off : disc.dsc_audio_off;
+	disc.load_bytes = disc.audio_off ? disc.audio_off + 8192 : disc.frame_bytes;
+	disc.vbi_slot_off = (disc.load_bytes + 7) & ~7u;
+}
+
+// Header block for the stream in use, with a new disc generation and an empty slot table.
+static void announce()
+{
+	uint32_t words = (disc.frame_bytes + 7) / 8;
+	gen = (uint16_t)(gen + 1) ? (uint16_t)(gen + 1) : 1;
+	uint32_t hb[56] = {};                // header words 0-27 as u32 pairs
+	hb[2] = disc.count;
+	hb[3] = words;
+	hb[4] = disc.field1_row | ((uint32_t)disc.crop_x << 16);
+	hb[5] = disc.crop_y | (disc.cvbs ? 1u << 16 : 0);   // w2 bit 48: the composite stream
+	hb[6] = disc.audio_off / 8;
+	hb[7] = disc.vbi ? disc.vbi_slot_off / 8 : 0;
+	memcpy(&hb[8], disc.pps, 128);
+	for (int k = 0; k < SLOTS; k++) hb[40 + k] = EMPTY;   // words 20-27: slot table
+	wr32(HDR, 0);
+	__sync_synchronize();
+	for (int i = 2; i < 56; i++) wr32(HDR + 4 * i, hb[i]);
+	__sync_synchronize();
+	wr32(HDR + 4, 1 | ((uint32_t)gen << 16));
+	__sync_synchronize();
+	wr32(HDR, HDR_MAGIC);
+	__sync_synchronize();
+	for (int k = 0; k < SLOTS; k++) slot_f[k] = EMPTY;
 }
 
 static void *reader_thread(void *)
@@ -123,10 +166,20 @@ static void *reader_thread(void *)
 	while (!reader_stop)
 	{
 		uint32_t magic = rd32(STAT), seq = rd32(STAT + 4), w1 = rd32(STAT + 8), w1h = rd32(STAT + 12);
-		uint32_t decoding = rd32(STAT + 16);
+		uint32_t decoding = rd32(STAT + 16), shown = rd32(STAT + 20);
 		if (magic != STAT_MAGIC || (w1h >> 16) != gen)
 		{
 			usleep(10000);               // the core has not seen this disc yet
+			continue;
+		}
+		// the core's menu chooses RGB (DSC) or composite: switch regions when it changes
+		int want_cvbs = (w1h >> 6) & 1;
+		if (want_cvbs != disc.cvbs && (disc.has_cvbs || !want_cvbs))
+		{
+			select_stream(want_cvbs);
+			announce();
+			last_seq = last_want = EMPTY;
+			printf("Laserdisc: %s stream, generation %u\n", want_cvbs ? "composite" : "DSC", gen);
 			continue;
 		}
 		uint32_t want = w1 & 0xFFFF;
@@ -160,7 +213,7 @@ static void *reader_thread(void *)
 		for (int k = 0; k < SLOTS && victim < 0; k++)
 		{
 			uint32_t f = slot_f[k];
-			if (f == want || f == decoding) continue;
+			if (f == want || f == decoding || f == shown) continue;   // composite plays the shown frame from its slot
 			int wanted = 0;
 			for (int i = 0; i <= AHEAD; i++) if ((int64_t)f == (int64_t)want + (int64_t)i * d) wanted = 1;
 			if (!wanted) victim = k;
@@ -196,7 +249,11 @@ void laserdisc_set_image(const char *path)
 		printf("Laserdisc: cannot map DDR3\n");
 		return;
 	}
-	if (have_disc) close(disc.fd);
+	if (have_disc)
+	{
+		close(disc.fd);
+		free(disc.vbi);
+	}
 	remove_disc();
 	if (!path || !path[0]) return;
 
@@ -216,41 +273,50 @@ void laserdisc_set_image(const char *path)
 	disc.height = le16(h + 18);
 	disc.field1_row = le16(h + 24);
 	disc.count = le32(h + 28);
-	disc.frame_bytes = le32(h + 40);
-	disc.stride = le32(h + 44);
-	disc.frames_off = le64(h + 48);
-	disc.audio_off = le32(h + 72);   // Laserdisc_MiSTer extension (tools/convert/dscv/tbc2dscv.c)
+	disc.dsc_frame_bytes = le32(h + 40);
+	disc.dsc_stride = le32(h + 44);
+	disc.dsc_frames_off = le64(h + 48);
+	disc.dsc_audio_off = le32(h + 72);   // Laserdisc_MiSTer extension (tools/convert/dscv/tbc2dscv.c)
+	if (!memcmp(h + 256, "CVB1", 4))    // composite region (tools/convert/dscv/add_cvbs.py)
+	{
+		disc.has_cvbs = 1;
+		disc.cvb_frames_off = le64(h + 264);
+		disc.cvb_stride = le32(h + 272);
+		disc.cvb_frame_bytes = le32(h + 276);
+		disc.cvb_audio_off = le32(h + 288);
+	}
 	memcpy(disc.pps, h + 128, 128);
-	disc.load_bytes = disc.audio_off ? disc.audio_off + 8192 : disc.frame_bytes;
-	if (disc.load_bytes > SLOT_SIZE || disc.load_bytes > disc.stride)
+	int bad = 0;
+	if (disc.has_cvbs)
+	{
+		select_stream(1);
+		bad = disc.vbi_slot_off + 16 > SLOT_SIZE || disc.load_bytes > disc.stride;
+	}
+	select_stream(0);
+	uint64_t vbi_file_off = le64(h + 56);
+	if (vbi_file_off && le32(h + 64) == 16)
+	{
+		size_t vbytes = (size_t)disc.count * 16;
+		disc.vbi = (uint8_t *)malloc(vbytes);
+		if (disc.vbi && pread(fd, disc.vbi, vbytes, (off_t)vbi_file_off) != (ssize_t)vbytes)
+		{
+			free(disc.vbi);
+			disc.vbi = NULL;
+		}
+	}
+	if (bad || disc.load_bytes > SLOT_SIZE || disc.load_bytes > disc.stride || disc.vbi_slot_off + 16 > SLOT_SIZE)
 	{
 		printf("Laserdisc: frames of %u bytes do not fit a slot\n", disc.load_bytes);
+		free(disc.vbi);
 		close(fd);
 		return;
 	}
 
-	// header: fill, then validate with a new generation
-	uint32_t words = (disc.frame_bytes + 7) / 8;
-	gen = (uint16_t)(gen + 1) ? (uint16_t)(gen + 1) : 1;
-	uint32_t hb[56] = {};                // header words 0-27 as u32 pairs
-	hb[2] = disc.count;
-	hb[3] = words;
-	hb[4] = disc.field1_row | ((uint32_t)disc.crop_x << 16);
-	hb[5] = disc.crop_y;
-	hb[6] = disc.audio_off / 8;
-	memcpy(&hb[8], disc.pps, 128);
-	for (int k = 0; k < SLOTS; k++) hb[40 + k] = EMPTY;   // words 20-27: slot table
-	for (int i = 2; i < 56; i++) wr32(HDR + 4 * i, hb[i]);
-	__sync_synchronize();
-	wr32(HDR + 4, 1 | ((uint32_t)gen << 16));
-	__sync_synchronize();
-	wr32(HDR, HDR_MAGIC);
-	__sync_synchronize();
-	for (int k = 0; k < SLOTS; k++) slot_f[k] = EMPTY;
+	announce();   // DSC first; the reader switches to composite if the core's menu asks for it
 	have_disc = 1;
 	loads = read_errors = 0;
-	printf("Laserdisc: %s, %u frames %ux%u, audio %s, generation %u\n", path, disc.count, disc.width, disc.height,
-	       disc.audio_off ? "yes" : "none", gen);
+	printf("Laserdisc: %s, %u frames %ux%u, audio %s, composite %s, generation %u\n", path, disc.count, disc.width,
+	       disc.height, disc.audio_off ? "yes" : "none", disc.has_cvbs ? "yes" : "none", gen);
 	if (start_on_core0(&reader, reader_thread) == 0) reader_running = 1;
 }
 
