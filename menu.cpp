@@ -2816,6 +2816,10 @@ void HandleUI(void)
 				mcd_set_image(ioctl_index, selPath);
 				game_docs_init(selPath, 0);
 			}
+			else if (is_laserdisc())
+			{
+				laserdisc_set_image(selPath);
+			}
 			else if (is_pce())
 			{
 				pcecd_set_image(ioctl_index, selPath);

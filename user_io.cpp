@@ -337,6 +337,13 @@ char is_megald()
 	return (is_megald_type == 1);
 }
 
+static int is_laserdisc_type = 0;
+char is_laserdisc()
+{
+	if (!is_laserdisc_type) is_laserdisc_type = strcasecmp(orig_name, "Laserdisc_MiSTer") ? 2 : 1;
+	return (is_laserdisc_type == 1);
+}
+
 static int is_pce_type = 0;
 char is_pce()
 {
@@ -495,6 +502,7 @@ void user_io_read_core_name()
 	is_minimig_type = 0;
 	is_megacd_type = 0;
 	is_megald_type = 0;
+	is_laserdisc_type = 0;
 	is_pce_type = 0;
 	is_archie_type = 0;
 	is_gba_type = 0;
@@ -4023,6 +4031,7 @@ void user_io_poll()
 	}
 
 	if (is_megacd()) mcd_poll();
+	if (is_laserdisc()) laserdisc_poll();
 	if (is_pce()) pcecd_poll();
 	if (is_saturn()) saturn_poll();
 	if (is_marty()) marty_poll();
