@@ -99,7 +99,10 @@ static int start_on_core0(pthread_t *t, void *(*fn)(void *))
 	return r;
 }
 
-static void load(int k, uint32_t f)
+// Load frame f into slot k. next (or -1) is the frame expected after it: the SD starts reading it while this one
+// is copied, so reading and copying overlap. In series they take 33 + 8 ms per composite frame (measured: SD
+// 21.7 MB/s, uncached DDR3 copy 86 MB/s), more than the 40 ms a frame lasts.
+static void load(int k, uint32_t f, int64_t next)
 {
 	wr32(TABLE + 4 * k, EMPTY);      // the slot is not this frame while its data changes
 	__sync_synchronize();
@@ -112,6 +115,9 @@ static void load(int k, uint32_t f)
 		return;
 	}
 	posix_fadvise(disc.fd, (off_t)off, (off_t)disc.load_bytes, POSIX_FADV_DONTNEED);
+	if (next >= 0 && next < disc.count)
+		posix_fadvise(disc.fd, (off_t)(disc.frames_off + (uint64_t)next * disc.stride), (off_t)disc.load_bytes,
+		              POSIX_FADV_WILLNEED);
 	memcpy(mem + RING + (size_t)k * SLOT_SIZE, stage, n);
 	if (disc.vbi) memcpy(mem + RING + (size_t)k * SLOT_SIZE + disc.vbi_slot_off, disc.vbi + (size_t)f * 16, 16);
 	__sync_synchronize();
@@ -223,7 +229,7 @@ static void *reader_thread(void *)
 			usleep(3000);
 			continue;
 		}
-		load(victim, (uint32_t)todo);
+		load(victim, (uint32_t)todo, todo + d);
 	}
 	return NULL;
 }
@@ -312,7 +318,10 @@ void laserdisc_set_image(const char *path)
 		return;
 	}
 
-	announce();   // DSC first; the reader switches to composite if the core's menu asks for it
+	// announce the stream the core's menu already asks for (status w1 bit 38), so a mount is one generation and the
+	// core never switches streams under a decode just started
+	if (disc.has_cvbs && rd32(STAT) == STAT_MAGIC && ((rd32(STAT + 12) >> 6) & 1)) select_stream(1);
+	announce();
 	have_disc = 1;
 	loads = read_errors = 0;
 	printf("Laserdisc: %s, %u frames %ux%u, audio %s, composite %s, generation %u\n", path, disc.count, disc.width,
