@@ -27,6 +27,7 @@
 #include <string.h>
 #include <unistd.h>
 
+#include "../../file_io.h"
 #include "../../shmem.h"
 #include "laserdisc.h"
 
@@ -372,7 +373,10 @@ void laserdisc_set_image(const char *path)
 	reserved = -1;
 	last_ws = -1;
 	if (!path || !path[0]) return;
-	open_disc(path);
+	// the menu gives a path relative to the storage root (games/Laserdisc/...), an MGL an absolute one
+	char full[1024];
+	snprintf(full, sizeof(full), "%s", getFullPath(path));
+	open_disc(full);
 }
 
 // The player turned the disc: open the other side's file. The slot of the picture on screen is kept, since the core
