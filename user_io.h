@@ -285,7 +285,7 @@ char user_io_a2_woz_enabled();
 char is_neogeo();
 char is_neogeo_cd();
 char is_megacd();
-char is_laserdisc();  // Laserdisc_MiSTer (support/laserdisc)
+char is_laserdisc();  // the Laserdisc core (support/laserdisc)
 char is_megald();   // the LaserActive build of the Mega CD core
 char is_pce();
 char is_archie();

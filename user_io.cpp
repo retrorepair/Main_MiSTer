@@ -340,7 +340,7 @@ char is_megald()
 static int is_laserdisc_type = 0;
 char is_laserdisc()
 {
-	if (!is_laserdisc_type) is_laserdisc_type = strcasecmp(orig_name, "Laserdisc_MiSTer") ? 2 : 1;
+	if (!is_laserdisc_type) is_laserdisc_type = strcasecmp(orig_name, "Laserdisc") ? 2 : 1;
 	return (is_laserdisc_type == 1);
 }
 
