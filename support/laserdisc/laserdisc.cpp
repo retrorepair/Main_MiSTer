@@ -72,6 +72,7 @@ static int inited = 0;
 static uint32_t loads = 0, read_errors = 0;
 static int last_ws = -1;             // the side the core last asked for (status w1 bits 40-41); -1 not seen yet
 static volatile int reserved = -1;   // a slot the core plays a held picture from, over a side change
+static uint16_t load_id = 0;         // counts Load disc (header w2 bits 51-63); a side change or stream switch keeps it
 
 static uint32_t rd32(uint32_t off) { return *(volatile uint32_t *)(mem + off); }
 static void wr32(uint32_t off, uint32_t v) { *(volatile uint32_t *)(mem + off) = v; }
@@ -160,7 +161,8 @@ static void announce()
 	hb[4] = disc.field1_row | ((uint32_t)disc.crop_x << 16);
 	hb[5] = disc.crop_y | (disc.cvbs ? 1u << 16 : 0)    // w2 bit 48: the composite stream
 	      | (disc.two_sided ? 1u << 17 : 0)               // bit 49: the other side is available
-	      | (disc.side == 2 ? 1u << 18 : 0);              // bit 50: side B
+	      | (disc.side == 2 ? 1u << 18 : 0)               // bit 50: side B
+	      | ((uint32_t)(load_id & 0x1FFF) << 19);         // bits 51-63: the load number
 	hb[6] = disc.audio_off / 8;
 	hb[7] = disc.vbi ? disc.vbi_slot_off / 8 : 0;
 	memcpy(&hb[8], disc.pps, 128);
@@ -376,6 +378,7 @@ void laserdisc_set_image(const char *path)
 	// the menu gives a path relative to the storage root (games/Laserdisc/...), an MGL an absolute one
 	char full[1024];
 	snprintf(full, sizeof(full), "%s", getFullPath(path));
+	load_id = (load_id + 1) & 0x1FFF ? (load_id + 1) & 0x1FFF : 1;   // never 0
 	open_disc(full);
 }
 
