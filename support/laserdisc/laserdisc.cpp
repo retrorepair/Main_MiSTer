@@ -12,6 +12,11 @@
 //               frame, player state, generation, frame being decoded, frame on screen, counters
 //   0x30100000  16 slots of 1 MB: the frame's picture and audio as stored in the stream, then its 16-byte VBI
 //               table entry (lines 16, 17, 329, 330), which the core's player reads like the disc's VBI
+//
+// Two-side play: a file whose name (without .dscv) ends "side1" or "side2" is one side of a disc when the file
+// with the other digit exists beside it (user, 2026-11-04). The header tells the core (w2 bit 49: two sides, bit 50:
+// this is side B). When the player turns (status w1 bits 40-41 change to the side wanted), the other file is opened.
+// The core holds the last picture through the change, so the slot it plays from is kept until side B is up.
 
 #include <fcntl.h>
 #include <pthread.h>
@@ -49,6 +54,8 @@ struct dscv
 	uint64_t frames_off;
 	uint16_t width, height, field1_row, crop_x, crop_y;
 	uint8_t pps[128];
+	int side, two_sided;             // 1 A, 2 B (0: not a side file); the other side's file exists
+	char other[1024];                // that file
 };
 
 static uint8_t *mem = NULL;          // LD_BASE .. LD_BASE + MAP_SIZE, uncached
@@ -62,6 +69,8 @@ static volatile int reader_stop = 0;
 static int reader_running = 0;
 static int inited = 0;
 static uint32_t loads = 0, read_errors = 0;
+static int last_ws = -1;             // the side the core last asked for (status w1 bits 40-41); -1 not seen yet
+static volatile int reserved = -1;   // a slot the core plays a held picture from, over a side change
 
 static uint32_t rd32(uint32_t off) { return *(volatile uint32_t *)(mem + off); }
 static void wr32(uint32_t off, uint32_t v) { *(volatile uint32_t *)(mem + off) = v; }
@@ -148,7 +157,9 @@ static void announce()
 	hb[2] = disc.count;
 	hb[3] = words;
 	hb[4] = disc.field1_row | ((uint32_t)disc.crop_x << 16);
-	hb[5] = disc.crop_y | (disc.cvbs ? 1u << 16 : 0);   // w2 bit 48: the composite stream
+	hb[5] = disc.crop_y | (disc.cvbs ? 1u << 16 : 0)    // w2 bit 48: the composite stream
+	      | (disc.two_sided ? 1u << 17 : 0)               // bit 49: the other side is available
+	      | (disc.side == 2 ? 1u << 18 : 0);              // bit 50: side B
 	hb[6] = disc.audio_off / 8;
 	hb[7] = disc.vbi ? disc.vbi_slot_off / 8 : 0;
 	memcpy(&hb[8], disc.pps, 128);
@@ -188,6 +199,14 @@ static void *reader_thread(void *)
 			printf("Laserdisc: %s stream, generation %u\n", want_cvbs ? "composite" : "DSC", gen);
 			continue;
 		}
+		// the held slot is free once the core has left the turn (player state 11) for two frame boundaries
+		static uint32_t rel_seq = EMPTY;
+		if (reserved >= 0)
+		{
+			if ((w1h & 0xF) == 11) rel_seq = EMPTY;
+			else if (rel_seq == EMPTY) rel_seq = seq;
+			else if (seq - rel_seq >= 2) { reserved = -1; rel_seq = EMPTY; }
+		}
 		uint32_t want = w1 & 0xFFFF;
 		if (seq != last_seq)
 		{
@@ -215,9 +234,10 @@ static void *reader_thread(void *)
 
 		// a free slot, else one holding a frame not wanted, never the wanted or decoding frame
 		int victim = -1;
-		for (int k = 0; k < SLOTS && victim < 0; k++) if (slot_f[k] == EMPTY) victim = k;
+		for (int k = 0; k < SLOTS && victim < 0; k++) if (slot_f[k] == EMPTY && k != reserved) victim = k;
 		for (int k = 0; k < SLOTS && victim < 0; k++)
 		{
+			if (k == reserved) continue;
 			uint32_t f = slot_f[k];
 			if (f == want || f == decoding || f == shown) continue;   // composite plays the shown frame from its slot
 			int wanted = 0;
@@ -247,29 +267,31 @@ static void reader_halt()
 
 // ------------------------------------------------------------------ public
 
-void laserdisc_set_image(const char *path)
+// The side this file is, from its name, and the other side's file if it exists.
+static void find_sides(const char *path)
 {
-	reader_halt();
-	if (!map())
-	{
-		printf("Laserdisc: cannot map DDR3\n");
-		return;
-	}
-	if (have_disc)
-	{
-		close(disc.fd);
-		free(disc.vbi);
-	}
-	remove_disc();
-	if (!path || !path[0]) return;
+	disc.side = disc.two_sided = 0;
+	size_t n = strlen(path);
+	if (n >= sizeof(disc.other)) return;
+	const char *dot = strrchr(path, '.');
+	const char *slash = strrchr(path, '/');
+	size_t stem = (dot && (!slash || dot > slash)) ? (size_t)(dot - path) : n;
+	if (stem < 5 || strncasecmp(path + stem - 5, "side", 4) || (path[stem - 1] != '1' && path[stem - 1] != '2')) return;
+	disc.side = path[stem - 1] - '0';
+	strcpy(disc.other, path);
+	disc.other[stem - 1] = disc.side == 1 ? '2' : '1';
+	disc.two_sided = access(disc.other, R_OK) == 0;
+}
 
+static int open_disc(const char *path)
+{
 	int fd = open(path, O_RDONLY | O_CLOEXEC);
 	uint8_t h[512];
 	if (fd < 0 || pread(fd, h, sizeof(h), 0) != (ssize_t)sizeof(h) || memcmp(h, "DSCV", 4))
 	{
 		printf("Laserdisc: %s is not a DSCV stream\n", path);
 		if (fd >= 0) close(fd);
-		return;
+		return 0;
 	}
 	disc = {};
 	disc.fd = fd;
@@ -292,6 +314,7 @@ void laserdisc_set_image(const char *path)
 		disc.cvb_audio_off = le32(h + 288);
 	}
 	memcpy(disc.pps, h + 128, 128);
+	find_sides(path);
 	int bad = 0;
 	if (disc.has_cvbs)
 	{
@@ -315,7 +338,7 @@ void laserdisc_set_image(const char *path)
 		printf("Laserdisc: frames of %u bytes do not fit a slot\n", disc.load_bytes);
 		free(disc.vbi);
 		close(fd);
-		return;
+		return 0;
 	}
 
 	// announce the stream the core's menu already asks for (status w1 bit 38), so a mount is one generation and the
@@ -324,13 +347,66 @@ void laserdisc_set_image(const char *path)
 	announce();
 	have_disc = 1;
 	loads = read_errors = 0;
-	printf("Laserdisc: %s, %u frames %ux%u, audio %s, composite %s, generation %u\n", path, disc.count, disc.width,
-	       disc.height, disc.audio_off ? "yes" : "none", disc.has_cvbs ? "yes" : "none", gen);
+	printf("Laserdisc: %s, %u frames %ux%u, audio %s, composite %s, side %s, generation %u\n", path, disc.count,
+	       disc.width, disc.height, disc.audio_off ? "yes" : "none", disc.has_cvbs ? "yes" : "none",
+	       !disc.side ? "-" : disc.side == 1 ? (disc.two_sided ? "A of 2" : "A") : (disc.two_sided ? "B of 2" : "B"),
+	       gen);
 	if (start_on_core0(&reader, reader_thread) == 0) reader_running = 1;
+	return 1;
+}
+
+void laserdisc_set_image(const char *path)
+{
+	reader_halt();
+	if (!map())
+	{
+		printf("Laserdisc: cannot map DDR3\n");
+		return;
+	}
+	if (have_disc)
+	{
+		close(disc.fd);
+		free(disc.vbi);
+	}
+	remove_disc();
+	reserved = -1;
+	last_ws = -1;
+	if (!path || !path[0]) return;
+	open_disc(path);
+}
+
+// The player turned the disc: open the other side's file. The slot of the picture on screen is kept, since the core
+// holds that picture until side B is up (composite plays it from the slot).
+static void switch_side()
+{
+	char path[1024];
+	strcpy(path, disc.other);
+	uint32_t shown = rd32(STAT + 20);
+	int keep = -1;
+	for (int k = 0; k < SLOTS; k++) if (shown != EMPTY && slot_f[k] == shown) keep = k;
+	reader_halt();
+	close(disc.fd);
+	free(disc.vbi);
+	disc.vbi = NULL;
+	have_disc = 0;
+	reserved = keep;
+	printf("Laserdisc: turning to %s (held slot %d)\n", path, keep);
+	open_disc(path);
 }
 
 void laserdisc_poll()
 {
+	// a turn: the core asks for the other side (status w1 bits 40-41 change to it)
+	if (have_disc && rd32(STAT) == STAT_MAGIC && (rd32(STAT + 12) >> 16) == gen)
+	{
+		int ws = (rd32(STAT + 12) >> 8) & 3;
+		if (last_ws < 0) last_ws = ws;
+		else if (ws != last_ws)
+		{
+			last_ws = ws;
+			if (ws && ws != disc.side && disc.two_sided) switch_side();
+		}
+	}
 	if (!inited)
 	{
 		// a new session of the core: no disc until one is chosen (DDR3 keeps the last session's header)
