@@ -50,6 +50,7 @@ struct dscv
 	uint32_t count, frame_bytes, stride, load_bytes, audio_off, vbi_slot_off;   // the stream in use
 	uint64_t dsc_frames_off, cvb_frames_off;
 	uint32_t dsc_frame_bytes, dsc_stride, dsc_audio_off, cvb_frame_bytes, cvb_stride, cvb_audio_off;
+	int has_digital;                 // each frame has a digital (EFM) audio block after the analogue one
 	int has_cvbs, cvbs;              // a composite region exists (tools/convert/dscv/add_cvbs.py); it is in use
 	uint8_t *vbi;                    // the stream's VBI table, 16 bytes per frame (NULL: none)
 	uint64_t frames_off;
@@ -147,7 +148,8 @@ static void select_stream(int cvbs)
 	disc.frame_bytes = cvbs ? disc.cvb_frame_bytes : disc.dsc_frame_bytes;
 	disc.stride = cvbs ? disc.cvb_stride : disc.dsc_stride;
 	disc.audio_off = cvbs ? disc.cvb_audio_off : disc.dsc_audio_off;
-	disc.load_bytes = disc.audio_off ? disc.audio_off + 8192 : disc.frame_bytes;
+	// the analogue audio block (8 KB), and the digital one after it when the disc has digital audio
+	disc.load_bytes = disc.audio_off ? disc.audio_off + (disc.has_digital ? 16384 : 8192) : disc.frame_bytes;
 	disc.vbi_slot_off = (disc.load_bytes + 7) & ~7u;
 }
 
@@ -165,7 +167,8 @@ static void announce()
 	      | (disc.side == 2 ? 1u << 18 : 0)               // bit 50: side B
 	      | ((uint32_t)(load_id & 0x1FFF) << 19);         // bits 51-63: the load number
 	hb[6] = disc.audio_off / 8;
-	hb[7] = (disc.vbi ? disc.vbi_slot_off / 8 : 0) | (disc.ntsc ? 1u << 31 : 0);   // w3 bit 63: NTSC
+	hb[7] = (disc.vbi ? disc.vbi_slot_off / 8 : 0) | (disc.ntsc ? 1u << 31 : 0)    // w3 bit 63: NTSC
+	      | (disc.has_digital ? 1u << 30 : 0);                                     // bit 62: digital audio
 	memcpy(&hb[8], disc.pps, 128);
 	for (int k = 0; k < SLOTS; k++) hb[40 + k] = EMPTY;   // words 20-27: slot table
 	wr32(HDR, 0);
@@ -310,6 +313,9 @@ static int open_disc(const char *path)
 	disc.dsc_stride = le32(h + 44);
 	disc.dsc_frames_off = le64(h + 48);
 	disc.dsc_audio_off = le32(h + 72);   // Laserdisc_MiSTer extension (tools/convert/dscv/tbc2dscv.c)
+	// digital audio: header byte 88 (DSC region) and CVB1 byte 300 (composite region), each the block after the
+	// analogue one; both regions must have it, since the core reads the same layout from either
+	disc.has_digital = disc.dsc_audio_off && le32(h + 88) == disc.dsc_audio_off + 8192;
 	if (!memcmp(h + 256, "CVB1", 4))    // composite region (tools/convert/dscv/add_cvbs.py)
 	{
 		disc.has_cvbs = 1;
@@ -317,6 +323,7 @@ static int open_disc(const char *path)
 		disc.cvb_stride = le32(h + 272);
 		disc.cvb_frame_bytes = le32(h + 276);
 		disc.cvb_audio_off = le32(h + 288);
+		if (le32(h + 300) != disc.cvb_audio_off + 8192) disc.has_digital = 0;
 	}
 	memcpy(disc.pps, h + 128, 128);
 	find_sides(path);
