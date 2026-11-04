@@ -56,6 +56,7 @@ struct dscv
 	uint16_t width, height, field1_row, crop_x, crop_y;
 	uint8_t pps[128];
 	int side, two_sided;             // 1 A, 2 B (0: not a side file); the other side's file exists
+	int ntsc;                        // a 525-line capture (DSCV src_height)
 	char other[1024];                // that file
 };
 
@@ -164,7 +165,7 @@ static void announce()
 	      | (disc.side == 2 ? 1u << 18 : 0)               // bit 50: side B
 	      | ((uint32_t)(load_id & 0x1FFF) << 19);         // bits 51-63: the load number
 	hb[6] = disc.audio_off / 8;
-	hb[7] = disc.vbi ? disc.vbi_slot_off / 8 : 0;
+	hb[7] = (disc.vbi ? disc.vbi_slot_off / 8 : 0) | (disc.ntsc ? 1u << 31 : 0);   // w3 bit 63: NTSC
 	memcpy(&hb[8], disc.pps, 128);
 	for (int k = 0; k < SLOTS; k++) hb[40 + k] = EMPTY;   // words 20-27: slot table
 	wr32(HDR, 0);
@@ -298,6 +299,7 @@ static int open_disc(const char *path)
 	}
 	disc = {};
 	disc.fd = fd;
+	disc.ntsc = le16(h + 10) == 525;
 	disc.crop_x = le16(h + 12);
 	disc.crop_y = le16(h + 14);
 	disc.width = le16(h + 16);
